@@ -29,3 +29,5 @@ dump/
 .zcode/
 .gitattributes
 AGENTS.md
+web/node_modules/
+web/dist/

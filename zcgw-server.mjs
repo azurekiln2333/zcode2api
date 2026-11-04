@@ -1695,14 +1695,15 @@ async function handleClaimable(req, res) {
 }
 
 /** 一键领取：POST { label?, planId? } */
-async function handleClaim(req, res) {
+async function handleClaim(req, res, labelOverride) {
   const raw = await readBody(req);
   let body = {};
   try {
     body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
   } catch {}
 
-  const targets = body.label ? accounts.filter((a) => a.label === body.label) : accounts.filter((a) => !a.disabled);
+  const targetLabel = body.label || labelOverride;
+  const targets = targetLabel ? accounts.filter((a) => a.label === targetLabel) : accounts.filter((a) => !a.disabled);
   const results = [];
   for (const acc of targets) {
     try {
@@ -2391,20 +2392,390 @@ async function handlePanelLogin(req, res) {
   return sendJson(res, 200, { ok: true });
 }
 
+// ── 控制台 API（/api/*，cnb2api-console 同款契约）──
+const DIST_DIR = path.join(import.meta.dirname, 'web', 'dist');
+const STATIC_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/json',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+};
+
+function serveDistFile(res, filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const buf = fs.readFileSync(filePath);
+  res.writeHead(200, {
+    'content-type': STATIC_MIME[ext] || 'application/octet-stream',
+    'content-length': buf.length,
+    ...(ext === '.html' ? { 'cache-control': 'no-store, must-revalidate' } : { 'cache-control': 'public, max-age=86400' }),
+  });
+  res.end(buf);
+}
+
+/** 托管 web/dist 构建产物；dist 不存在时回退旧版单文件面板。返回 true 表示已处理。 */
+function serveConsoleStatic(req, res, pathname) {
+  const indexFile = path.join(DIST_DIR, 'index.html');
+  if (!fs.existsSync(indexFile)) return false;
+  if (pathname === '/' || pathname === '/dashboard' || pathname === '/index.html') {
+    serveDistFile(res, indexFile);
+    return true;
+  }
+  const candidate = path.resolve(DIST_DIR, '.' + pathname);
+  if (candidate.startsWith(DIST_DIR) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+    serveDistFile(res, candidate);
+    return true;
+  }
+  return false;
+}
+
+function accountQuotaSnapshot(a) {
+  const qc = quotaCache.get(a.label);
+  if (!qc || !qc.total) return null;
+  const total = Number(qc.total) || 0;
+  const remaining = Math.max(0, Number(qc.remaining) || 0);
+  const used = Math.max(0, total - remaining);
+  return {
+    org: a.label,
+    credits: { total, used, freeze: 0 },
+    dev: { total: 0, used: 0, freeze: 0 },
+    ci: { total: 0, used: 0 },
+    syncedAt: new Date(qc.ts || Date.now()).toISOString(),
+  };
+}
+
+/** 汇聚成 cnb2api-console 的 Overview 形状（accounts/settings/hourly/stats）。 */
+function buildOverview() {
+  const now = Date.now();
+  const usageBy = new Map();
+  for (const r of usageLog) {
+    const k = r.acc ?? '-';
+    const cur = usageBy.get(k) ?? { requests: 0, errors: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+    cur.requests++;
+    if (!r.ok) cur.errors++;
+    cur.input += r.in || 0;
+    cur.output += r.out || 0;
+    cur.cacheRead += r.cacheRead || 0;
+    cur.cacheCreate += r.cacheCreate || 0;
+    usageBy.set(k, cur);
+  }
+  const hourMs = 3600_000;
+  const hourly = [];
+  for (let i = 23; i >= 0; i--) {
+    const start = Math.floor((now - i * hourMs) / hourMs) * hourMs;
+    hourly.push({ at: new Date(start).toISOString(), requests: 0, errors: 0, durationMs: 0, accounts: {}, _ms: 0, _n: 0 });
+  }
+  const byHour = new Map(hourly.map((b) => [b.at, b]));
+  let todayStart = Math.floor((now + 8 * 3600000) / 86400000) * 86400000 - 8 * 3600000;
+  const todayAgg = { requests: 0, errors: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, msSum: 0 };
+  for (const r of usageLog) {
+    if (r.t < now - 24 * hourMs) continue;
+    const start = Math.floor(r.t / hourMs) * hourMs;
+    const b = byHour.get(new Date(start).toISOString());
+    if (!b) continue;
+    b.requests++;
+    if (!r.ok) b.errors++;
+    b._ms += r.ms || 0;
+    b._n++;
+    const k = r.acc ?? '-';
+    b.accounts[k] = (b.accounts[k] || 0) + 1;
+  }
+  for (const b of hourly) {
+    b.durationMs = b._n ? Math.round(b._ms / b._n) : 0;
+    delete b._ms;
+    delete b._n;
+  }
+  for (const r of usageLog) {
+    if (r.t < todayStart) continue;
+    todayAgg.requests++;
+    if (!r.ok) todayAgg.errors++;
+    todayAgg.input += r.in || 0;
+    todayAgg.output += r.out || 0;
+    todayAgg.cacheRead += r.cacheRead || 0;
+    todayAgg.cacheCreate += r.cacheCreate || 0;
+    todayAgg.msSum += r.ms || 0;
+  }
+  const totalAgg = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+  for (const r of usageLog) {
+    totalAgg.input += r.in || 0;
+    totalAgg.output += r.out || 0;
+    totalAgg.cacheRead += r.cacheRead || 0;
+    totalAgg.cacheCreate += r.cacheCreate || 0;
+  }
+  const tokenTotals = (src, reported) => ({
+    input: src.input || 0,
+    output: src.output || 0,
+    cacheRead: src.cacheRead || 0,
+    cacheWrite: src.cacheCreate || 0,
+    total: (src.input || 0) + (src.output || 0),
+    reportedRequests: reported,
+    missingRequests: 0,
+    partialRequests: 0,
+  });
+  const startedAt = usageLog.length ? new Date(usageLog[0].t).toISOString() : new Date(now).toISOString();
+
+  const mapped = accounts.map((a) => {
+    const u = usageBy.get(a.label) ?? usageBy.get('-') ?? { requests: 0, errors: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+    const iso = (ms) => (ms && ms > 0 ? new Date(ms).toISOString() : null);
+    const cooling = a.cooldownUntil > now;
+    const status = a.disabled ? 'pending' : cooling || a.degradeUntil > now ? 'unhealthy' : a.cooldownUntil <= now && a.degradeUntil <= now ? 'healthy' : 'unhealthy';
+    return {
+      id: a.label,
+      name: a.name || a.label,
+      label: a.label,
+      uid: a.uid,
+      group: a.realm === 'cn' ? '国内版' : a.realm === 'intl' ? '国际版' : '未标注',
+      realm: a.realm ?? 'unknown',
+      identity: a.identity ?? null,
+      email: a.email ?? null,
+      phone: a.phone ?? null,
+      weight: Math.round(weightOf(a, Math.max(1, quotaCache.get(a.label)?.remaining || 0), now) * 10) / 10,
+      manualWeight: a.weight ?? 1,
+      priority: 1,
+      enabled: !a.disabled,
+      disabled: !!a.disabled,
+      hasAccessToken: !!a.hasAccessToken,
+      status,
+      checkedAt: iso(a.lastSuccess),
+      registeredAt: iso(a.lastSuccess),
+      cooldownUntil: iso(a.cooldownUntil),
+      cooldownMin: cooling ? Math.ceil((a.cooldownUntil - now) / 60000) : 0,
+      failures: a.failures || 0,
+      latencyMs: null,
+      lastError: a.lastErr || '',
+      quota: accountQuotaSnapshot(a),
+      plans: (a.plans ?? []).map((p) => ({ id: p.id, name: p.name, nameZh: p.nameZh, kind: p.kind, kindZh: p.kindZh, status: p.status, endsAt: p.endsAt })),
+      requests: u.requests,
+      errors: u.errors,
+      activeRequests: a.inFlight || 0,
+      createdAt: new Date(now).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+      tokenUsage: tokenTotals(u, u.requests),
+    };
+  });
+  const quotaAccounts = mapped.filter((m) => m.quota);
+  const remainingCredits = quotaAccounts.reduce((s, m) => s + Math.max(0, m.quota.credits.total - m.quota.credits.used - m.quota.credits.freeze), 0);
+  const totalCredits = quotaAccounts.reduce((s, m) => s + m.quota.credits.total, 0);
+  const stats = {
+    total: mapped.length,
+    ready: mapped.filter((m) => m.enabled && m.status === 'healthy').length,
+    cooling: mapped.filter((m) => m.cooldownUntil && Date.parse(m.cooldownUntil) > now).length,
+    disabled: mapped.filter((m) => !m.enabled).length,
+    requests: todayAgg.requests,
+    errors: todayAgg.errors,
+    successRate: todayAgg.requests ? Math.round(((todayAgg.requests - todayAgg.errors) / todayAgg.requests) * 1000) / 10 : null,
+    remainingCredits: quotaAccounts.length ? remainingCredits : null,
+    totalCredits: quotaAccounts.length ? totalCredits : null,
+    quotaOrganizations: quotaAccounts.length,
+    averageDurationMs: todayAgg.requests ? Math.round(todayAgg.msSum / todayAgg.requests) : null,
+    activeRequests: accounts.reduce((s, a) => s + (a.inFlight || 0), 0),
+    tokenUsage: { today: tokenTotals(todayAgg, todayAgg.requests), total: tokenTotals(totalAgg, usageLog.length), startedAt },
+  };
+  const settings = {
+    strategy: 'weighted',
+    sessionAffinity: POOL.stickyTtlMin > 0,
+    stickyTtlMin: POOL.stickyTtlMin,
+    topN: POOL.topN,
+    maxInFlight: POOL.maxInFlight,
+    breakerThreshold: POOL.breakerThreshold,
+    breakerCooldownMin: POOL.breakerCooldownMin,
+    blockedCooldownMin: POOL.blockedCooldownMin,
+    quotaCooldownMin: POOL.quotaCooldownMin,
+    busyCooldownSec: POOL.busyCooldownSec,
+    minPickGapMs: POOL.minPickGapMs,
+    idleWeightPerHour: POOL.idleWeightPerHour,
+    idleWeightMax: POOL.idleWeightMax,
+    weightBalFactor: POOL.weightBalFactor,
+    weightSuccFactor: POOL.weightSuccFactor,
+    weekendGrab: true,
+    limits: POOL_LIMITS,
+  };
+  return { accounts: mapped, settings, hourly, stats };
+}
+
+async function handleConsoleApi(req, res, url) {
+  const p = url.pathname;
+  // GET /api/overview —— 控制台主数据（cnb2api-console Overview 契约）
+  if (req.method === 'GET' && p === '/api/overview') {
+    return sendJson(res, 200, buildOverview());
+  }
+  // GET /api/logs —— q/outcome 过滤 + 分页 + 导出
+  if (req.method === 'GET' && p === '/api/logs') {
+    const download = url.searchParams.get('download') === '1';
+    const limit = Math.min(Number(url.searchParams.get('limit')) || 20, 500);
+    const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
+    const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const outcome = url.searchParams.get('outcome') || 'all';
+    let rows = usageLog.slice().reverse().map((r, i) => ({
+      id: `req-${r.t}-${usageLog.length - i}`,
+      at: new Date(r.t).toISOString(),
+      kind: 'request',
+      accountId: r.acc ?? null,
+      accountName: r.acc ?? '-',
+      status: r.ok ? 200 : 502,
+      ok: !!r.ok,
+      err: r.err || null,
+      message: r.err
+        ? `${r.model ?? ''} ${r.err}`.trim() || '请求失败'
+        : `${r.model ?? ''} 完成`.trim() || '请求完成',
+      ip: r.ip ?? null,
+      model: r.model ?? null,
+      durationMs: r.ms ?? null,
+      tokenUsage: {
+        input: r.in || 0, output: r.out || 0, cacheRead: r.cacheRead || 0, cacheWrite: r.cacheCreate || 0,
+        total: (r.in || 0) + (r.out || 0), reportedRequests: 1, missingRequests: 0, partialRequests: 0,
+      },
+    }));
+    if (q) {
+      rows = rows.filter((r) =>
+        `${r.accountName} ${r.model ?? ''} ${r.ip ?? ''} ${r.message}`.toLowerCase().includes(q),
+      );
+    }
+    if (outcome === 'success') rows = rows.filter((r) => r.ok);
+    if (outcome === 'failure') rows = rows.filter((r) => !r.ok);
+    if (download) {
+      const buf = Buffer.from(JSON.stringify({ total: rows.length, logs: rows.slice(offset, offset + 1000) }, null, 2));
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-disposition': 'attachment; filename="requests-logs.json"',
+        'content-length': buf.length,
+      });
+      return res.end(buf);
+    }
+    return sendJson(res, 200, { logs: rows.slice(offset, offset + limit), total: rows.length, limit, offset });
+  }
+  // GET /api/models
+  if (req.method === 'GET' && p === '/api/models') {
+    const models = [
+      { id: 'GLM-5.3-Flash', name: 'GLM-5.3 Flash' },
+      { id: 'GLM-5.3', name: 'GLM-5.3' },
+      ...(process.env.ZCODE_EXTRA_MODELS || '').split(',').filter(Boolean).map((m) => ({ id: m.trim(), name: m.trim() })),
+    ];
+    const enabled = accounts.filter((a) => !a.disabled);
+    return sendJson(res, 200, {
+      models: models.map((m) => ({
+        id: m.id,
+        listed: true,
+        configuredAccounts: enabled.map((a) => ({ id: a.label, name: a.name || a.label })),
+        discoveredAccounts: [],
+        eligibleAccounts: enabled.filter((a) => !a.cooldownUntil || a.cooldownUntil <= Date.now()).map((a) => ({ id: a.label, name: a.name || a.label })),
+      })),
+    });
+  }
+  // GET /api/access + POST /api/access/key
+  if (req.method === 'GET' && p === '/api/access') {
+    const masked = GATEWAY_KEY ? `${GATEWAY_KEY.slice(0, 6)}${'•'.repeat(18)}${GATEWAY_KEY.slice(-4)}` : '未设置 GATEWAY_KEY（开放模式）';
+    return sendJson(res, 200, {
+      publicUrl: '',
+      maskedKey: masked,
+      gatewayKeySet: !!GATEWAY_KEY,
+      models: [
+        { id: 'GLM-5.3-Flash', name: 'GLM-5.3 Flash', context: 1000000, maxOutput: 131072 },
+        { id: 'GLM-5.3', name: 'GLM-5.3', context: 1000000, maxOutput: 131072 },
+      ],
+    });
+  }
+  if (req.method === 'POST' && p === '/api/access/key') {
+    if (!GATEWAY_KEY) return sendJson(res, 404, { error: '未设置 GATEWAY_KEY（当前为开放模式，无需密钥）' });
+    return sendJson(res, 200, { key: GATEWAY_KEY });
+  }
+  // PATCH /api/accounts/:id —— 启用停用 + 身份字段
+  const mAcc = p.match(/^\/api\/accounts\/(.+?)(?:\/(selftest|claim))?$/);
+  if (mAcc) {
+    const id = decodeURIComponent(mAcc[1]);
+    const sub = mAcc[2];
+    if (sub === 'selftest' && req.method === 'POST') {
+      const acc = accounts.find((a) => a.label === id);
+      if (!acc) return sendJson(res, 404, { ok: false, error: `找不到账号 ${id}` });
+      if (acc.disabled) return sendJson(res, 502, { ok: false, error: '账号已停用', account: id });
+      const started = Date.now();
+      try {
+        const body = buildUpstreamBody(
+          { model: DEFAULT_MODEL, max_tokens: 64, messages: [{ role: 'user', content: '请只回复两个字：正常' }] },
+          acc,
+        );
+        body.stream = false;
+        const r = await fetch(UPSTREAM_URL, {
+          method: 'POST',
+          headers: upstreamHeaders(acc),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(60000),
+        });
+        const j = await safeJson(r);
+        if (j.code && j.code !== 0) return sendJson(res, 502, { ok: false, error: `${j.code} ${j.msg || ''}`, account: id });
+        const txt = (j.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('').trim();
+        markSuccess(acc);
+        return sendJson(res, 200, { ok: true, account: id, text: txt, ms: Date.now() - started });
+      } catch (e) {
+        markFailure(acc, 60_000);
+        return sendJson(res, 502, { ok: false, error: e.message, account: id });
+      }
+    }
+    if (sub === 'claim' && req.method === 'POST') {
+      return handleClaim(req, res, id);
+    }
+    if (req.method === 'PATCH') {
+      const raw = await readBody(req);
+      let body = {};
+      try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+      const arr = fs.existsSync(ACC_FILE) ? JSON.parse(fs.readFileSync(ACC_FILE, 'utf8')) : [];
+      const target = arr.find((a) => (a.label || '') === id);
+      if (!target) return sendJson(res, 404, { error: `找不到账号 ${id}` });
+      if (body.enabled !== undefined) target.disabled = !body.enabled;
+      const email = String(body.email || '').trim();
+      if (email) {
+        target.email = email;
+        const r = realmFromIdentity(email);
+        target.realm = body.realm || (r === 'unknown' ? target.realm : r);
+      }
+      if (body.realm === 'cn' || body.realm === 'intl') target.realm = body.realm;
+      if (body.name) target.name = String(body.name).trim();
+      if (body.weight !== undefined) {
+        const w = Number(body.weight);
+        target.weight = Number.isFinite(w) ? Math.max(0, Math.min(20, w)) : 1;
+      }
+      fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
+      accounts = readAccountFile();
+      return sendJson(res, 200, { ok: true, account: id });
+    }
+  }
+  // PATCH /api/settings —— 调度参数
+  if (req.method === 'PATCH' && p === '/api/settings') {
+    const raw = await readBody(req);
+    let body = {};
+    try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+    const applied = applyPoolSettings(body);
+    return sendJson(res, 200, { ok: true, applied, settings: buildOverview().settings });
+  }
+  return sendJson(res, 404, { error: `no console api route ${req.method} ${p}` });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  // ── 面板鉴权（PANEL_KEY 设置后才启用）──
-  if (req.method === 'POST' && url.pathname === '/panel/session') {
-    return handlePanelLogin(req, res);
+  // ── 面板控制台会话（cnb2api-console 契约 + 旧 /panel/* 兼容）──
+  if (url.pathname === '/api/auth/config') {
+    return sendJson(res, 200, { keyLoginEnabled: true, sso: { enabled: false, providerName: '', loginUrl: '' } });
   }
-  if (req.method === 'DELETE' && url.pathname === '/panel/session') {
-    res.setHeader('set-cookie', `${PANEL_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
-    return sendJson(res, 200, { ok: true });
+  if (url.pathname === '/api/session' || url.pathname === '/panel/session') {
+    if (req.method === 'POST') return handlePanelLogin(req, res);
+    if (req.method === 'DELETE') {
+      res.setHeader('set-cookie', `${PANEL_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+      return sendJson(res, 200, { ok: true });
+    }
+    const authed = panelAuthed(req);
+    // 未登录返回 401：前端 establishSession() 靠抛异常进入登录页（cnb2api 同款契约）
+    if (!authed) return sendJson(res, 401, { authenticated: false, error: '面板未登录', code: 'panel_auth' });
+    return sendJson(res, 200, { authenticated: true, user: { name: '管理员', email: '', picture: '', provider: 'key' } });
   }
-  if (req.method === 'GET' && url.pathname === '/panel/state') {
+  if (url.pathname === '/panel/state') {
     return sendJson(res, 200, { authRequired: !!PANEL_KEY, authed: panelAuthed(req) });
   }
-  // 数据面（推理端点/健康检查）永远放行；其余管理面在设置 PANEL_KEY 后要求登录
+  // ── 鉴权门：数据面永远放行，控制台其余端点在设置 PANEL_KEY 后要求登录 ──
   const dataPlane =
     url.pathname === '/health' ||
     url.pathname === '/' ||
@@ -2412,10 +2783,17 @@ const server = http.createServer((req, res) => {
     url.pathname.startsWith('/v1/') ||
     url.pathname === '/models' ||
     url.pathname === '/messages' ||
-    url.pathname === '/chat/completions';
+    url.pathname === '/chat/completions' ||
+    url.pathname === '/api/auth/config' ||
+    url.pathname.startsWith('/api/session') ||
+    url.pathname.startsWith('/panel/session');
   if (PANEL_KEY && !dataPlane && !panelAuthed(req)) {
     return sendJson(res, 401, { error: '面板未登录或会话已过期', code: 'panel_auth' });
   }
+  // ── 控制台 API（/api 前缀）──
+  if (url.pathname.startsWith('/api/')) return handleConsoleApi(req, res, url);
+  // ── 静态资源：web/dist 构建产物优先，缺失时回退旧版单文件面板 ──
+  if (req.method === 'GET' && serveConsoleStatic(req, res, url.pathname)) return;
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
     const f = path.join(import.meta.dirname, 'dashboard.html');
     if (!fs.existsSync(f)) return sendJson(res, 404, { error: 'dashboard.html 缺失' });

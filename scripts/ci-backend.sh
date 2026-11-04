@@ -44,4 +44,10 @@ if [[ "$page" != *'账号池控制台'* ]]; then
   exit 1
 fi
 
+# 控制台构建校验（web/ 存在时：npm ci + vue-tsc 类型检查 + vite 打包）
+if [ -f web/package.json ]; then
+  echo "==> 构建控制台（vue-tsc + vite）"
+  (cd web && npm ci --no-audit --no-fund --loglevel=error && npm run build)
+fi
+
 echo "==> CI backend OK"
