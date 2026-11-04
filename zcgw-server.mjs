@@ -20,6 +20,29 @@ import { metadataUserId, sessionIdFor, requestId, userIdFromJwt, deviceIdFor } f
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const GATEWAY_KEY = process.env.GATEWAY_KEY || '';
+// 面板访问控制：设置 PANEL_KEY 后，除 /health、/v1/*、登录接口外的所有请求都要带会话 cookie。
+// 不设置则完全不拦截（本机/内网模式），不影响现有部署。
+const PANEL_KEY = process.env.PANEL_KEY || '';
+const PANEL_COOKIE = 'zcgw_panel';
+const PANEL_TTL_MS = 7 * 86400_000;
+
+function panelSign(expiresAt) {
+  return crypto.createHmac('sha256', PANEL_KEY).update(`zcgw-panel:${expiresAt}`).digest('base64url');
+}
+
+function panelAuthed(req) {
+  if (!PANEL_KEY) return true;
+  const m = String(req.headers.cookie || '').match(new RegExp(`(?:^|;\\s*)${PANEL_COOKIE}=([A-Za-z0-9._-]+)`));
+  if (!m) return false;
+  const [expStr, sig] = m[1].split('.');
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(panelSign(exp)));
+  } catch {
+    return false;
+  }
+}
 const UPSTREAM_ORIGIN = process.env.ZCODE_UPSTREAM_ORIGIN || 'https://zcode.z.ai';
 const UPSTREAM_URL = `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`;
 const APP_VERSION = process.env.ZCODE_APP_VERSION || '3.16.3';
@@ -255,9 +278,11 @@ function loadAccounts() {
 
   const jwt = localJwt();
   if (!jwt) {
-    console.error('既没有 accounts.json，也没有本地 ZCode 登录态。');
-    console.error('先打开 ZCode 客户端登录一次，或用面板的登录按钮纳管账号。');
-    process.exit(1);
+    // 空池不能退出：面板必须先起来，用户才能用「登录新账号」按钮纳管账号，
+    // 否则容器 crash loop，永远进不了面板（先有鸡还是先有蛋）
+    console.error('既没有 accounts.json，也没有本地 ZCode 登录态 —— 以空账号池启动。');
+    console.error('请打开面板点「登录新账号」纳管账号，或在 data/ 放一个 accounts.json 后重启。');
+    return [];
   }
   log('未找到 accounts.json，使用本地 ZCode 客户端凭证（单账号模式）');
   const uid = userIdFromJwt(jwt);
@@ -281,7 +306,17 @@ function loadAccounts() {
 }
 
 function readAccountFile() {
-  const arr = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+  let arr;
+  try {
+    arr = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+  } catch (e) {
+    console.error(`accounts.json 读取/解析失败（${e.message}）—— 以空账号池启动，请修复该文件后重启。`);
+    return [];
+  }
+  if (!Array.isArray(arr)) {
+    console.error('accounts.json 格式不对（顶层应为数组）—— 以空账号池启动。');
+    return [];
+  }
   return arr
     .filter((a) => a.jwt?.startsWith('eyJ'))
     .map((a) => {
@@ -300,6 +335,7 @@ function readAccountFile() {
         identity: displayIdentity({ email: a.email, phone: a.phone, realm }),
         hasAccessToken: !!a.zaiAccessToken,
         weight: Number(a.weight) || 1,
+        disabled: !!a.disabled, // 手动停用：不参与调度（区别于 weight=0 的软暂停）
         // 指纹按账号派生：同号恒定、跨号隔离（见 zcgw-fingerprint.mjs）
         deviceId: a.deviceId || deviceIdFor(uid),
         sessionId: sessionIdFor(uid),
@@ -551,7 +587,7 @@ function pickAccount(sessionKey) {
   const now = Date.now();
 
   const usable = (a) =>
-    a.cooldownUntil <= now && a.inFlight < POOL.maxInFlight && a.degradeUntil <= now;
+    !a.disabled && a.cooldownUntil <= now && a.inFlight < POOL.maxInFlight && a.degradeUntil <= now;
 
   // 1) 粘性：优先回到上次那个号
   const pinned = stickyGet(sessionKey);
@@ -574,7 +610,7 @@ function pickAccount(sessionKey) {
   if (!candidates.length) {
     // 全冷却兑底：从非永久禁用的号里选最早恢复的顶班（参考 workbuddy2api 全冷却兜底）
     const recovering = accounts
-      .filter((a) => a.inFlight < POOL.maxInFlight)
+      .filter((a) => !a.disabled && a.inFlight < POOL.maxInFlight)
       .sort((x, y) => Math.min(x.cooldownUntil, x.degradeUntil) - Math.min(y.cooldownUntil, y.degradeUntil));
     if (recovering.length) {
       log(`[pool] 全部冷却中，选最早恢复的 ${recovering[0].label} 顶班`);
@@ -700,6 +736,27 @@ function buildUserId(acc) {
   return metadataUserId(acc.uid);
 }
 
+/**
+ * 思考强度归一化 → 上游 output_config.effort（GLM 认 low/high/max 三档，即客户端 reasoning variants）。
+ * 优先级：显式 effort（OpenAI reasoning_effort / 直接传 output_config.effort）→ Anthropic thinking.budget_tokens 分档 → profile 默认。
+ */
+function effortOf(inbound) {
+  const v = inbound?.output_config?.effort ?? inbound?.reasoning_effort;
+  if (typeof v === 'string' && v) {
+    const s = v.toLowerCase();
+    if (s === 'max' || s === 'xhigh' || s === 'ultra') return 'max';
+    if (s === 'high' || s === 'medium') return 'high';
+    if (s === 'low' || s === 'minimal' || s === 'none') return 'low';
+  }
+  const budget = Number(inbound?.thinking?.budget_tokens);
+  if (Number.isFinite(budget) && budget > 0) {
+    if (budget <= 8192) return 'low';
+    if (budget <= 32768) return 'high';
+    return 'max';
+  }
+  return profile.output_config?.effort || 'low';
+}
+
 function buildUpstreamBody(inbound, acc) {
   const msgs = JSON.parse(JSON.stringify(inbound.messages ?? []));
   let sysText = '';
@@ -724,7 +781,7 @@ function buildUpstreamBody(inbound, acc) {
     messages: msgs,
     tool_choice: profile.tool_choice ?? { type: 'auto' },
     thinking: profile.thinking ?? { type: 'enabled' },
-    output_config: profile.output_config ?? { effort: 'low' },
+    output_config: { ...(profile.output_config ?? {}), effort: effortOf(inbound) },
     ...(Array.isArray(inbound.tools) && inbound.tools.length ? { tools: inbound.tools } : {}),
   };
 }
@@ -1052,6 +1109,8 @@ function openaiToAnthropic(body) {
   if (body.temperature !== undefined) out.temperature = body.temperature;
   if (body.top_p !== undefined) out.top_p = body.top_p;
   if (body.stop) out.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+  // 思考强度：OpenAI 的 reasoning_effort 透传给 effortOf 归一化成 GLM 的 low/high/max
+  if (typeof body.reasoning_effort === 'string' && body.reasoning_effort) out.reasoning_effort = body.reasoning_effort;
   return out;
 }
 
@@ -1106,6 +1165,12 @@ async function handleOpenAIChat(req, res) {
   basePayload.stream = false;
   const sessionKey = sessionKeyOf(req, inbound);
 
+  if (!accounts.length) {
+    return sendJson(res, 503, { error: { message: '尚未纳管任何账号：请打开面板点「登录新账号」，或在 data/accounts.json 配置 JWT', type: 'api_error' } });
+  }
+  if (!accounts.some((a) => !a.disabled)) {
+    return sendJson(res, 503, { error: { message: '账号池内所有账号已被手动停用：请在面板「账号管理」里重新启用', type: 'api_error' } });
+  }
   const maxAttempts = Math.min(accounts.length, 4);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (attempt > 0) stickyUnbind(sessionKey);
@@ -1201,6 +1266,12 @@ async function handleMessages(req, res) {
   const basePayload = buildUpstreamBody(inbound, { uid: 'placeholder' });
   const sessionKey = sessionKeyOf(req, inbound);
 
+  if (!accounts.length) {
+    return sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: '尚未纳管任何账号：请打开面板点「登录新账号」，或在 data/accounts.json 配置 JWT' } });
+  }
+  if (!accounts.some((a) => !a.disabled)) {
+    return sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: '账号池内所有账号已被手动停用：请在面板「账号管理」里重新启用' } });
+  }
   const maxAttempts = Math.min(accounts.length, 4);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // 重试时先解绑粘性：粘住的号已经失败过，继续粘着只会再撞一次墙
@@ -1369,6 +1440,7 @@ function handlePool(req, res) {
       name: a.name,
       identity: a.identity,
       weight: a.weight ?? 1,
+      disabled: !!a.disabled,
       hasAccessToken: a.hasAccessToken,
       realm: a.realm,
       realmZh: a.realmZh,
@@ -1392,10 +1464,11 @@ function handlePool(req, res) {
   });
 }
 
-/** 逐号查余额（billing/balance），同时喂给选号权重缓存 */
+/** 逐号查余额（billing/balance），同时喂给选号权重缓存；停用号跳过（不浪费上游请求） */
 async function handleQuota(req, res) {
   const out = [];
   for (const acc of accounts) {
+    if (acc.disabled) continue;
     try {
       const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, {
         headers: upstreamHeaders(acc),
@@ -1602,10 +1675,11 @@ async function claimFor(acc, planId) {
   return { ok: false, msg: tried.at(-1)?.msg || '没有可领取的套餐', tried };
 }
 
-/** 可领取的 plan 列表（一键领取的前置） */
+/** 可领取的 plan 列表（一键领取的前置）；停用号跳过 */
 async function handleClaimable(req, res) {
   const out = [];
   for (const acc of accounts) {
+    if (acc.disabled) continue;
     try {
       const { plans, rawCode, rawMsg } = await claimableFor(acc);
       out.push({
@@ -1628,7 +1702,7 @@ async function handleClaim(req, res) {
     body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
   } catch {}
 
-  const targets = body.label ? accounts.filter((a) => a.label === body.label) : accounts;
+  const targets = body.label ? accounts.filter((a) => a.label === body.label) : accounts.filter((a) => !a.disabled);
   const results = [];
   for (const acc of targets) {
     try {
@@ -1801,35 +1875,63 @@ async function handleIdentifyAll(req, res) {
 }
 
 
+const ONBOARD_PROVIDERS = ['zai', 'bigmodel'];
+
 async function handleOnboardStart(req, res) {
+  const raw = await readBody(req).catch(() => null);
+  let body = {};
+  try { body = raw?.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+  // 国内号走 bigmodel.cn 登录页，国际号走 chat.z.ai —— provider 选错整条授权链就是死的
+  const provider = ONBOARD_PROVIDERS.includes(body.provider) ? body.provider
+    : (ONBOARD_PROVIDERS.includes(process.env.ZCGW_ONBOARD_PROVIDER) ? process.env.ZCGW_ONBOARD_PROVIDER : 'zai');
   const pollToken = crypto.randomBytes(32).toString('hex');
-  const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/oauth/cli/init`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${pollToken}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ provider: 'zai' }),
-  });
-  const j = await safeJson(r);
+  let j;
+  try {
+    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/oauth/cli/init`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${pollToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ provider }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    j = await safeJson(r);
+  } catch (e) {
+    return sendJson(res, 502, { error: `上游授权服务不可达（${e.message}），请稍后重试`, code: 'upstream_unreachable' });
+  }
   if (j.code !== 0) return sendJson(res, 502, { error: j.msg || 'init 失败', raw: j });
   const { flow_id, authorize_url, expires_at, poll_interval_sec } = j.data;
-  pendingFlows.set(flow_id, { pollToken, createdAt: Date.now() });
+  // state 是授权链接的全局唯一标识：手动粘贴回调链接时靠它反查是哪个流程
+  let state = '';
+  try { state = new URL(authorize_url).searchParams.get('state') || ''; } catch {}
+  pendingFlows.set(flow_id, { pollToken, createdAt: Date.now(), provider, state });
   writeFlows(pendingFlows);
-  log(`onboard flow 已创建 ${flow_id}`);
-  sendJson(res, 200, { flowId: flow_id, authorizeUrl: authorize_url, expiresAt: expires_at, pollIntervalSec: poll_interval_sec });
+  log(`onboard flow 已创建 ${flow_id} (provider=${provider})`);
+  sendJson(res, 200, { flowId: flow_id, authorizeUrl: authorize_url, expiresAt: expires_at, pollIntervalSec: poll_interval_sec, provider });
 }
 
-async function handleOnboardPoll(req, res, flowId) {
-  const flow = pendingFlows.get(flowId);
-  if (!flow) return sendJson(res, 404, { error: 'flow 不存在或已过期，请重新发起登录', code: 'flow_missing' });
-
-  const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/oauth/cli/poll/${encodeURIComponent(flowId)}`, {
-    headers: { authorization: `Bearer ${flow.pollToken}` },
-  });
-  const j = await safeJson(r);
-  if (j.code !== 0) return sendJson(res, 502, { error: j.msg || 'poll 失败', raw: j });
+/**
+ * 轮询上游授权状态，ready 时完成入库/领额度。
+ * 返回 { http, body } 由调用方 sendJson —— 永远快速返回 JSON，绝不悬挂，
+ * 否则反代（nginx 默认 60s read_timeout）会先吐 HTML 502，面板只能看到笼统报错。
+ */
+async function pollOnboardFlow(flowId, flow) {
+  let j;
+  try {
+    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/oauth/cli/poll/${encodeURIComponent(flowId)}`, {
+      headers: { authorization: `Bearer ${flow.pollToken}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    j = await safeJson(r);
+  } catch (e) {
+    return { http: 503, body: { error: `上游暂时不可达（${e.message}），会继续自动重试`, code: 'upstream_unreachable' } };
+  }
+  // 上游返回了非 JSON（限流 429 / 网关页）：瞬态，让面板继续等
+  if (j.__error) return { http: 503, body: { error: `上游响应异常（HTTP ${j.__status}），会继续自动重试`, code: 'upstream_unreachable' } };
+  // 3004 = flow 不存在/已过期/已消费，重试没有意义，让面板停下来提示重新发起
+  if (j.code === 3004) return { http: 410, body: { error: '授权流程已过期或已失效，请重新发起登录', code: 'flow_missing' } };
+  if (j.code !== 0) return { http: 502, body: { error: j.msg || 'poll 失败', code: 'upstream_error', raw: j } };
 
   const st = j.data?.status;
-  if (st === 'pending') return sendJson(res, 200, { status: 'pending' });
-  if (st !== 'ready') return sendJson(res, 200, { status: st });
+  if (st !== 'ready') return { http: 200, body: { status: st || 'pending' } };
 
   // 授权完成：拿 JWT + OAuth access_token → 入库 → 查真实身份 → 立即领取 → 回读余额
   const jwt = j.data.token;
@@ -1863,27 +1965,101 @@ async function handleOnboardPoll(req, res, flowId) {
   let claim = null;
   let quota = null;
   if (acc) {
+    // 并行跑且各自有超时：串行最坏 40s+，叠加 nginx 60s 就会 502 —— 那时账号其实已入库
     try {
-      claim = await claimFor(acc);
-      quota = await quotaOf(acc);
+      [claim, quota] = await Promise.all([
+        claimFor(acc).catch((e) => ({ ok: false, msg: e.message })),
+        quotaOf(acc).catch((e) => null),
+      ]);
     } catch (e) {
       claim = { ok: false, msg: e.message };
     }
   }
 
-  sendJson(res, 200, {
-    status: 'ready',
-    added,
-    label: acc?.label ?? label,
-    userId: uid,
-    email: acc?.email ?? email,
-    phone: acc?.phone ?? phone,
-    identity: acc?.identity ?? displayIdentity({ email, phone }),
-    realm: acc?.realm ?? realm,
-    hasAccessToken: acc?.hasAccessToken ?? !!accessToken,
-    claim,
-    quota,
-  });
+  return {
+    http: 200,
+    body: {
+      status: 'ready',
+      added,
+      label: acc?.label ?? label,
+      userId: uid,
+      email: acc?.email ?? email,
+      phone: acc?.phone ?? phone,
+      identity: acc?.identity ?? displayIdentity({ email, phone }),
+      realm: acc?.realm ?? realm,
+      hasAccessToken: acc?.hasAccessToken ?? !!accessToken,
+      claim,
+      quota,
+    },
+  };
+}
+
+async function handleOnboardPoll(req, res, flowId) {
+  const flow = pendingFlows.get(flowId);
+  if (!flow) return sendJson(res, 410, { error: 'flow 不存在或已过期，请重新发起登录', code: 'flow_missing' });
+  const r = await pollOnboardFlow(flowId, flow);
+  return sendJson(res, r.http, r.body);
+}
+
+/** 粘贴授权完成链接兑付：POST { url? / flowId? / code? + state? }
+ *  浏览器授权完最后落在 zcode.z.ai/api/v1/oauth/cli/callback/<provider>?code=..&state=..
+ *  —— 正常情况下浏览器自己访问它就完成了，这里允许把该链接交给服务端代访一次，
+ *  用来兜「浏览器到上游回调不通」的场景；code 已被浏览器消费过也没关系，直接落到 poll。
+ *  流程定位顺序：显式 flowId → 按链接里的 state 反查 → 待决流程只有一个时兜底。 */
+async function handleOnboardRedeem(req, res) {
+  const raw = await readBody(req);
+  let body = {};
+  try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+
+  let code = String(body.code || '').trim();
+  let state = String(body.state || '').trim();
+  const pasted = String(body.url || '').trim();
+  if ((!code || !state) && pasted) {
+    // 容忍三种粘贴形态：完整 URL、裸查询串 code=..&state=..、或 JSON 里直接给 code/state
+    const u = /^https?:\/\//i.test(pasted) ? pasted : `https://local/?${pasted.replace(/^[?&]+/, '')}`;
+    try {
+      const q = new URL(u).searchParams;
+      code = code || (q.get('code') || '').trim();
+      state = state || (q.get('state') || '').trim();
+    } catch {}
+  }
+
+  let flowId = String(body.flowId || '').trim();
+  let flow = flowId ? pendingFlows.get(flowId) : null;
+  if (!flow && state) {
+    for (const [id, f] of pendingFlows) {
+      if (f.state === state) { flowId = id; flow = f; break; }
+    }
+  }
+  if (!flow && !flowId && pendingFlows.size === 1) {
+    [flowId, flow] = [...pendingFlows.entries()][0];
+  }
+  if (!flow) {
+    return sendJson(res, 410, {
+      error: '没有匹配的授权流程：链接里的 state 过期/不认识（授权流程 20 分钟有效），请重新点「登录新账号」再走一遍',
+      code: 'flow_missing',
+    });
+  }
+
+  // 先裸 poll：浏览器可能已经自己完成了回调，此时绝不能再代访（坏 code 会把流程打死）
+  let r = await pollOnboardFlow(flowId, flow);
+  if (r.body.status !== 'pending' || !code || !state) return sendJson(res, r.http, r.body);
+
+  // 确实还 pending 且手里有 code+state：代访一次上游 callback 再 poll 判定
+  const cb = `${UPSTREAM_ORIGIN}/api/v1/oauth/cli/callback/${flow.provider || 'zai'}`
+    + `?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`;
+  try {
+    await fetch(cb, { headers: { 'user-agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(10_000) });
+    // 不看响应：code 失效/已消费/成功，统一由随后的 poll 判定真实状态
+  } catch (e) {
+    log(`onboard redeem 回调代访失败（继续 poll）：${e.message}`);
+  }
+  r = await pollOnboardFlow(flowId, flow);
+  // 代访后立刻 3004 ≈ code 无效把流程打死了，提示语说清楚根因
+  if (r.http === 410) {
+    r.body.error = '链接无效或 code 已失效（上游已关闭该授权流程），请重新点「登录新账号」再走一遍';
+  }
+  return sendJson(res, r.http, r.body);
 }
 
 
@@ -1913,6 +2089,8 @@ async function handleAccountUpdate(req, res) {
     const w = Number(body.weight);
     target.weight = Number.isFinite(w) ? Math.max(0, Math.min(20, w)) : 1;
   }
+  // 手动停用：true = 彻底退出调度（含全冷却兜底），与 weight=0 的软暂停不同
+  if (body.disabled !== undefined) target.disabled = !!body.disabled;
 
   fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
   accounts = readAccountFile();
@@ -2195,8 +2373,49 @@ async function handleSecurityUpdate(req, res) {
   sendJson(res, 200, { ok: true, ...out, security: { enabled: security.enabled, mode: security.mode, rules: security.rules } });
 }
 
+/** 面板登录：POST { key } —— 与 PANEL_KEY 恒等比较，通过后签发 7 天会话 cookie */
+async function handlePanelLogin(req, res) {
+  const raw = await readBody(req);
+  let body = {};
+  try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+  const key = String(body.key || '');
+  if (!PANEL_KEY) return sendJson(res, 400, { error: '未设置 PANEL_KEY，面板处于免登录模式' });
+  let ok = false;
+  try {
+    ok = key.length === PANEL_KEY.length && crypto.timingSafeEqual(Buffer.from(key), Buffer.from(PANEL_KEY));
+  } catch {}
+  if (!ok) return sendJson(res, 401, { error: '管理密钥不正确', code: 'panel_auth' });
+  const exp = Date.now() + PANEL_TTL_MS;
+  res.setHeader('set-cookie', `${PANEL_COOKIE}=${exp}.${panelSign(exp)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(PANEL_TTL_MS / 1000)}`);
+  log('面板登录成功');
+  return sendJson(res, 200, { ok: true });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  // ── 面板鉴权（PANEL_KEY 设置后才启用）──
+  if (req.method === 'POST' && url.pathname === '/panel/session') {
+    return handlePanelLogin(req, res);
+  }
+  if (req.method === 'DELETE' && url.pathname === '/panel/session') {
+    res.setHeader('set-cookie', `${PANEL_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+    return sendJson(res, 200, { ok: true });
+  }
+  if (req.method === 'GET' && url.pathname === '/panel/state') {
+    return sendJson(res, 200, { authRequired: !!PANEL_KEY, authed: panelAuthed(req) });
+  }
+  // 数据面（推理端点/健康检查）永远放行；其余管理面在设置 PANEL_KEY 后要求登录
+  const dataPlane =
+    url.pathname === '/health' ||
+    url.pathname === '/' ||
+    url.pathname === '/dashboard' ||
+    url.pathname.startsWith('/v1/') ||
+    url.pathname === '/models' ||
+    url.pathname === '/messages' ||
+    url.pathname === '/chat/completions';
+  if (PANEL_KEY && !dataPlane && !panelAuthed(req)) {
+    return sendJson(res, 401, { error: '面板未登录或会话已过期', code: 'panel_auth' });
+  }
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
     const f = path.join(import.meta.dirname, 'dashboard.html');
     if (!fs.existsSync(f)) return sendJson(res, 404, { error: 'dashboard.html 缺失' });
@@ -2289,6 +2508,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && url.pathname === '/accounts/add') return handleAccountAdd(req, res);
   if (req.method === 'POST' && url.pathname === '/accounts/update') return handleAccountUpdate(req, res);
   if (req.method === 'POST' && url.pathname === '/onboard/start') return handleOnboardStart(req, res);
+  if (req.method === 'POST' && url.pathname === '/onboard/redeem') return handleOnboardRedeem(req, res);
   if (req.method === 'GET' && url.pathname.startsWith('/onboard/poll/')) {
     return handleOnboardPoll(req, res, decodeURIComponent(url.pathname.slice('/onboard/poll/'.length)));
   }
@@ -2330,7 +2550,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   log(`zcgw-server listening on http://${HOST}:${PORT}`);
-  log(`accounts: ${accounts.map((a) => a.label).join(', ')}`);
+  log(`accounts: ${accounts.length ? accounts.map((a) => a.label).join(', ') : '(空) —— 打开面板点「登录新账号」纳管账号'}`);
   log(`gateway key: ${GATEWAY_KEY ? '(set)' : '(WARNING: 未设置，任何人可用)'}`);
   log(`scheduler: weighted-random topN=${POOL.topN} sticky=${POOL.stickyTtlMin}min`);
 
@@ -2371,8 +2591,8 @@ server.listen(PORT, HOST, () => {
         // 周五(5) 18 点后 / 周六(6) 全天 / 周日(0) 24 点前
         const inWindow = (day === 5 && hour >= 18) || day === 6 || (day === 0);
         if (!inWindow) return;
-        // 找缺 promo 的号（有访问资格才领）
-        for (const acc of accounts) {
+        // 找缺 promo 的号（有访问资格才领）；手动停用的号不碰
+        for (const acc of accounts.filter((a) => !a.disabled)) {
           const active = await activeGrants(acc);
           const kinds = new Set(active.map((p) => describePlan(p.plan_id, p.name).kind));
           if (kinds.has('promo')) continue;

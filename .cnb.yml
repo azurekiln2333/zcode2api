@@ -1,0 +1,66 @@
+# CNB (cnb.cool) 云原生构建流水线 —— 与 GitHub Actions 共用 scripts/ci-backend.sh
+#
+#   main / PR  → 语法检查 + 冷启动冒烟
+#   v* 标签    → 校验 + 构建镜像推送到 CNB 制品库 + 创建 Release
+#
+# 镜像仓库与凭据默认用平台签发的 CNB_TOKEN；如需自定义，在仓库设置里配
+# CNB_REGISTRY / CNB_REGISTRY_USER / CNB_REGISTRY_PASSWORD / CNB_IMAGE。
+
+main:
+  push: &verify
+    - name: verify-backend
+      docker:
+        image: node:24-bookworm
+      stages:
+        - name: test-backend
+          script: bash scripts/ci-backend.sh
+
+  pull_request:
+    - name: verify-pull-request
+      docker:
+        image: node:24-bookworm
+      stages:
+        - name: test-backend
+          script: bash scripts/ci-backend.sh
+
+"v*":
+  tag_push:
+    - name: verify-and-publish
+      docker:
+        image: node:24-bookworm
+      stages:
+        - name: test-backend
+          script: bash scripts/ci-backend.sh
+        - name: build-and-push-image
+          image: cnbcool/default-dev-env:latest
+          script: |
+            set -euo pipefail
+            TAG="$CNB_BRANCH"
+            VERSION=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' package.json | head -1)
+            if [ "$TAG" != "v$VERSION" ]; then
+              echo "Release tag must be v$VERSION, received $TAG" >&2
+              exit 1
+            fi
+            REGISTRY="${CNB_REGISTRY:-docker.cnb.cool}"
+            REGISTRY_USER="${CNB_REGISTRY_USER:-cnb}"
+            REGISTRY_PASSWORD="${CNB_REGISTRY_PASSWORD:-${CNB_TOKEN:?CNB_TOKEN is not set}}"
+            IMAGE="${CNB_IMAGE:-$REGISTRY/azurekiln/zcode2api}"
+            echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+            docker build -t "$IMAGE:$TAG" .
+            docker push "$IMAGE:$TAG"
+            case "$VERSION" in
+              *-*) echo "prerelease $VERSION, latest tag skipped" ;;
+              *)
+                docker tag "$IMAGE:$TAG" "$IMAGE:latest"
+                docker push "$IMAGE:latest"
+                ;;
+            esac
+            echo "pushed $IMAGE:$TAG"
+        - name: create-release
+          type: git:release
+          options:
+            title: "zcgw $CNB_BRANCH"
+            description: |
+              Docker image: `docker pull docker.cnb.cool/azurekiln/zcode2api:$CNB_BRANCH`
+              data/ 目录保存全部账号与配置，升级镜像不影响数据。
+            latest: true

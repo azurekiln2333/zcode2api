@@ -12,7 +12,7 @@
 
 services:
   zcgw:
-    build: .
+    build: .                    # 源码构建；走 CI 镜像可注释 build 改用 image: ghcr.io/azurekiln2333/zcode2api:latest
     image: zcgw:latest
     container_name: zcgw
     restart: unless-stopped
@@ -24,6 +24,9 @@ services:
       PORT: 8787
       # 可选：主密钥（面板密钥之外的后门 key）；一般留空用面板建的 key
       GATEWAY_KEY: ""
+      # 可选：面板登录口令 —— 设置后面板需密钥登录（7 天会话），数据面 /v1/* 不受影响；
+      # 留空 = 面板免登录（仅建议本机/内网使用）。公网部署务必设置！
+      # PANEL_KEY: "change-me-to-a-long-secret"
       # 上游与模型（一般不用改）
       ZCODE_UPSTREAM_ORIGIN: "https://zcode.z.ai"
       ZCODE_MODEL: "GLM-5.3-Flash"

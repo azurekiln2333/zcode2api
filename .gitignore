@@ -15,3 +15,17 @@ onboard-flows.json
 node_modules/
 vault/
 dump/
+
+# AI 工具本地工作区 —— 不入库
+.agents/
+.claude/
+.codebuddy/
+.codex/
+.cursor/
+.dsh/
+.opencode/
+.pi/
+.trellis/
+.zcode/
+.gitattributes
+AGENTS.md

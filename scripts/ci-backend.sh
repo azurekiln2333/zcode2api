@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# 零依赖后端的共享 CI 校验脚本：GitHub Actions 与 CNB 流水线共用。
+# 步骤：语法检查 → 空数据目录冷启动 → /health 探活 → 空池聊天请求应得到明确 503。
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "==> node $(node --version)"
+echo "==> 语法检查"
+node --check zcgw-server.mjs
+node --check zcgw-fingerprint.mjs
+
+echo "==> 冷启动冒烟（空数据目录）"
+DATA_DIR="$(mktemp -d)"
+PORT="${CI_PORT:-12283}"
+ZCGW_DATA_DIR="$DATA_DIR" ZCODE_HOME="$DATA_DIR/no-zcode" HOST=127.0.0.1 PORT="$PORT" \
+  node zcgw-server.mjs > "$DATA_DIR/server.log" 2>&1 &
+SRV_PID=$!
+cleanup() { kill "$SRV_PID" 2>/dev/null || true; rm -rf "$DATA_DIR"; }
+trap cleanup EXIT
+
+for i in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:$PORT/health" > "$DATA_DIR/health.json" 2>/dev/null; then break; fi
+  if ! kill -0 "$SRV_PID" 2>/dev/null; then
+    echo "server exited during boot:" >&2; cat "$DATA_DIR/server.log" >&2; exit 1
+  fi
+  sleep 0.5
+  if [ "$i" = 30 ]; then echo "health check timed out" >&2; cat "$DATA_DIR/server.log" >&2; exit 1; fi
+done
+cat "$DATA_DIR/health.json"
+echo
+
+echo "==> 空池聊天请求应返回 503 提示"
+code="$(curl -s -o "$DATA_DIR/chat.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/messages" \
+  -H 'content-type: application/json' \
+  -d '{"model":"GLM-5.3-Flash","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}')"
+cat "$DATA_DIR/chat.json"; echo
+if [ "$code" != "503" ]; then echo "expected 503 for empty pool, got $code" >&2; exit 1; fi
+
+echo "==> dashboard.html 可访问"
+curl -fsS "http://127.0.0.1:$PORT/dashboard" | grep -q '账号池控制台'
+
+echo "==> CI backend OK"
