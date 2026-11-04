@@ -37,6 +37,11 @@ cat "$DATA_DIR/chat.json"; echo
 if [ "$code" != "503" ]; then echo "expected 503 for empty pool, got $code" >&2; exit 1; fi
 
 echo "==> dashboard.html 可访问"
-curl -fsS "http://127.0.0.1:$PORT/dashboard" | grep -q '账号池控制台'
+# 完整读取后用字符串匹配：pipefail 下 grep -q 提前退出会杀掉管道对端（exit 23/141）
+page="$(curl -fsS "http://127.0.0.1:$PORT/dashboard")"
+if [[ "$page" != *'账号池控制台'* ]]; then
+  echo "dashboard missing title marker" >&2
+  exit 1
+fi
 
 echo "==> CI backend OK"
