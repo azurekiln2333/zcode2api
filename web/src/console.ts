@@ -1,5 +1,6 @@
 import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
+import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
 import type { Account, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
 
 const overview = ref<Overview | null>(null)
@@ -128,7 +129,8 @@ async function refreshLogs(channel: LogChannel = 'requests', query = logQueries[
 }
 
 /**
- * 账号行内操作：probe → 网关自检（真实走一次上游推理），quota → 领取可用套餐额度。
+ * 账号行内操作：probe → 网关自检（真实走一次上游推理），quota → 领取套餐额度。
+ * 领取前先跑阿里云人机验证（上游 claim 强制），3007 时自动换新验证参数重试一轮。
  */
 async function action(id: string, operation: 'probe' | 'quota') {
   if (busy.value.has(id)) return
@@ -147,12 +149,31 @@ async function action(id: string, operation: 'probe' | 'quota') {
         !result.ok,
       )
     } else {
-      const result = await api<{ results?: Array<{ ok: boolean; alreadyClaimed?: boolean; expired?: boolean; claimed?: string; msg?: string }> }>(
-        `/accounts/${encodeURIComponent(id)}/claim`,
-        'POST',
-        {},
-      )
-      const x = (result.results ?? [])[0] ?? {}
+      let last: { ok: boolean; alreadyClaimed?: boolean; expired?: boolean; claimed?: string; msg?: string; code?: number | string } | undefined
+      // 验证参数是一次性的：最多两轮（首轮 + 3007 换新参数重试）
+      for (let attempt = 0; attempt < 2; attempt++) {
+        captchaState.value = 'verifying'
+        let param: string
+        try {
+          param = await runCaptcha()
+        } catch (e) {
+          last = { ok: false, msg: e instanceof Error ? e.message : '人机验证失败' }
+          break
+        }
+        const result = await api<{ results?: Array<{ ok: boolean; alreadyClaimed?: boolean; expired?: boolean; claimed?: string; msg?: string; code?: number | string }> }>(
+          `/accounts/${encodeURIComponent(id)}/claim`,
+          'POST',
+          { captchaParam: param },
+        )
+        last = (result.results ?? [])[0]
+        if (last?.code === 3007) {
+          captchaMessage.value = '验证参数已过期，正在重新验证…'
+          continue
+        }
+        break
+      }
+      cancelCaptcha()
+      const x = last ?? { ok: false, msg: '领取未返回结果' }
       if (x.expired) notify('注册礼包已领过（新号专属，4 天窗口）', true)
       else if (x.ok && x.alreadyClaimed) notify('额度已在生效中，无需重复领取')
       else if (x.ok) notify(`已成功领取 ${x.claimed ?? '额度'}`)
@@ -160,6 +181,7 @@ async function action(id: string, operation: 'probe' | 'quota') {
     }
     await refresh()
   } catch (error) {
+    cancelCaptcha()
     notify(
       error instanceof Error ? error.message : '操作失败',
       true,
@@ -301,6 +323,8 @@ export function useConsole() {
     toasts,
     registration,
     accounts: computed(() => overview.value?.accounts ?? []),
+    captchaState,
+    captchaMessage,
     refresh,
     refreshLogs,
     reset,

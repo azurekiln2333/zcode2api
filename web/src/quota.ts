@@ -11,11 +11,12 @@ export function formatRemainingQuotaPercent(credits: {
   return `${((remaining / total) * 100).toLocaleString('zh-CN', { maximumFractionDigits: 1 })}%`
 }
 
-/** 汇总号池额度：每个账号一条快照（zcgw 没有组织概念，org 即账号）。 */
+/** 汇总号池额度：每个账号一条快照（zcgw 没有组织概念，org 即账号）。
+ *  停用号也计入 —— 停用只关调度，额度还是这个号的额度。 */
 export function summarizeQuota(accounts: Account[]) {
   const snapshots = new Map<string, Quota>()
-  for (const account of accounts.filter((item) => item.enabled && item.quota)) {
-    snapshots.set(account.quota!.org, account.quota!)
+  for (const account of accounts) {
+    if (account.quota) snapshots.set(account.quota.org, account.quota)
   }
   const quotas = [...snapshots.values()]
   const times = quotas.map((item) => item.syncedAt).sort()

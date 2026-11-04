@@ -1464,11 +1464,11 @@ function handlePool(req, res) {
   });
 }
 
-/** 逐号查余额（billing/balance），同时喂给选号权重缓存；停用号跳过（不浪费上游请求） */
+/** 逐号查余额（billing/balance），同时喂给选号权重缓存。
+ *  停用号也照常查：停用只退出调度，额度展示与领取资格不受影响。 */
 async function handleQuota(req, res) {
   const out = [];
   for (const acc of accounts) {
-    if (acc.disabled) continue;
     try {
       const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, {
         headers: upstreamHeaders(acc),
@@ -1539,6 +1539,79 @@ async function claimableFor(acc) {
   return { plans, rawCode: j.code ?? (j.__error ? -1 : 0), rawMsg: j.msg ?? j.__error ?? '' };
 }
 
+// ── 领取资格：双通道（对齐 zcode-switch）──
+// billing/preview 只是其一；新版活动（客户端弹窗/banner）只经 marketing/touch 下发，
+// deliveries 按钮带 claim_zcode_plan 的 plan_id。2026-11 的 GLOBAL BUILD 活动实测只出现在
+// marketing 通道 —— 只猜日期编码会永远领不到。
+
+/** 递归收集 delivery 里活动按钮的 plan_id（action.type = claim_zcode_plan） */
+function collectClaimButtons(v, out) {
+  if (Array.isArray(v)) {
+    for (const it of v) collectClaimButtons(it, out);
+  } else if (v && typeof v === 'object') {
+    const action = v.action;
+    if (action && typeof action === 'object') {
+      const ty = action.type || '';
+      if (ty === 'claim_zcode_plan' || ty === 'claim_plan') {
+        const id = String(action.args?.plan_id || action.planId || '').trim();
+        if (id) out.push(id);
+      }
+    }
+    for (const val of Object.values(v)) collectClaimButtons(val, out);
+  }
+}
+
+/** marketing/touch 通道：返回可领 planId 列表（失败静默为空 —— 通道缺失不算故障） */
+async function marketingClaimableIds(acc) {
+  try {
+    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/marketing/touch?seq=0`, {
+      headers: upstreamHeaders(acc),
+      signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
+    });
+    if (!r.ok) return [];
+    const j = await safeJson(r);
+    if ((j.code ?? -1) !== 0) return [];
+    const ids = [];
+    for (const d of j.data?.deliveries ?? []) collectClaimButtons(d, ids);
+    return [...new Set(ids)];
+  } catch {
+    return [];
+  }
+}
+
+/** 合并 preview + marketing 双通道的可领套餐（marketing 只补按钮 id，preview 优先） */
+async function claimCandidates(acc, planId) {
+  if (planId) return [planId];
+  const { plans } = await claimableFor(acc);
+  const ids = plans.map((p) => p.planId);
+  const extra = await marketingClaimableIds(acc);
+  for (const id of extra) if (!ids.includes(id)) ids.push(id);
+  return ids;
+}
+
+// ── 阿里云验证码配置（claim 必带 X-Aliyun-Captcha-Verify-Param，否则 3007）──
+let captchaConfigCache = { ts: 0, cfg: null };
+const CAPTCHA_CFG_DEFAULT = { enabled: true, region: 'cn', prefix: 'no8xfe', sceneId: '11xygtvd' };
+
+async function captchaConfig() {
+  if (captchaConfigCache.cfg && Date.now() - captchaConfigCache.ts < 600_000) return captchaConfigCache.cfg;
+  try {
+    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/client/configs`, {
+      headers: { 'user-agent': `ZCode/${APP_VERSION}`, 'http-referer': UPSTREAM_ORIGIN },
+      signal: AbortSignal.timeout(8000),
+    });
+    const j = await safeJson(r);
+    const c = j.data?.configs?.captcha;
+    const cfg = c && c.enabled
+      ? { enabled: true, region: c.region || 'cn', prefix: c.prefix || 'no8xfe', sceneId: c.sceneId || '11xygtvd' }
+      : CAPTCHA_CFG_DEFAULT;
+    captchaConfigCache = { ts: Date.now(), cfg };
+    return cfg;
+  } catch {
+    return captchaConfigCache.cfg || CAPTCHA_CFG_DEFAULT;
+  }
+}
+
 /** 从 balance 里看当前已激活的非日包（周末包等） */
 async function activeGrants(acc) {
   try {
@@ -1563,46 +1636,16 @@ async function activeGrants(acc) {
  * 结果永远不去领每日体验包（-0817），导致某些号只有周末包、没有每日额度。
  * 现在改成「按额度类型（kind）分别判断缺哪个，只补缺的那一类」。
  */
-async function claimFor(acc, planId) {
-  const candidates = planId ? [planId] : [];
-  let missingKinds = [];
-
-  if (!planId) {
-    const active = await activeGrants(acc);
-    const activeKinds = new Set(active.map((p) => describePlan(p.plan_id, p.name).kind));
-
-    const { plans } = await claimableFor(acc);
-    for (const p of plans) candidates.push(p.planId);
-
-    // 只看「缺的类型」生成兑底候选，已有的类型不复重试
-    const bj = Date.now() + 8 * 3600_000;
-    const stamps = [0, -1, 1].map((delta) => {
-      const d = new Date(bj + delta * 86400_000);
-      return `${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-    });
-
-    // 活动大包：带日期编码，每周新发
-    if (!activeKinds.has('promo')) {
-      for (const s of stamps) candidates.push(`zcode-v3-start-plan-${s}-wk`);
-      missingKinds.push('promo');
-    }
-    // 每日体验包：固定 id、一次性，领过就永久标记 → 只试这一个，不多发请求（多发会 429）
-    if (!activeKinds.has('daily')) {
-      candidates.push('zcode-v3-start-plan-0817');
-      missingKinds.push('daily');
-    }
-
-    // 所有类型都在效，才算真的不用领
-    if (!missingKinds.length) {
-      const first = active[0];
-      return {
-        ok: true,
-        alreadyClaimed: true,
-        claimed: first?.plan_id,
-        msg: first ? `${first.name} 已生效` : '已领取',
-      };
-    }
+async function claimFor(acc, planId, captchaParam) {
+  if (!captchaParam || !captchaParam.trim()) {
+    // 上游 claim 已强制阿里云人机验证（3007 captcha verify failed），无验证参数直接拒绝，
+    // 避免白白消耗候选重试。前端负责跑阿里云 SDK 拿 captchaVerifyParam。
+    return { ok: false, code: 'captcha_required', msg: '需要人机验证：请从面板发起领取（会自动完成无痕验证）' };
   }
+  const candidates = await claimCandidates(acc, planId);
+  const captchaHeaders = {
+    'x-aliyun-captcha-verify-param': captchaParam.trim(),
+  };
 
   const tried = [];
   const claimed = [];
@@ -1617,7 +1660,7 @@ async function claimFor(acc, planId) {
     try {
       const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/claim`, {
         method: 'POST',
-        headers: upstreamHeaders(acc),
+        headers: { ...upstreamHeaders(acc), ...captchaHeaders },
         body: JSON.stringify({ plan_id: pid }),
         signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
       });
@@ -1638,10 +1681,14 @@ async function claimFor(acc, planId) {
     tried.push({ planId: pid, code, msg });
     log(`[${acc.label}] claim ${pid} -> ${code} ${msg}`);
 
-    // 领到了：继续试下一个缺失类型（以前在这里就 return，导致只领到一个）
+    // 3007 验证码校验失败（参数过期/已用）：验证参数是一次性的，换下一个候选也没用，直接终态
+    if (code === 3007) {
+      return { ok: false, code: 3007, msg: '验证码参数已过期或已使用，请重新发起领取', tried };
+    }
+    // 领到了：验证参数已消费，收工（一次验证领一个套餐）
     if (code === 0 && j.data?.plan) {
       claimed.push({ planId: pid, plan: j.data.plan });
-      continue;
+      break;
     }
     // 1003 已领过：记下来，不阻断其它候选
     if (code === 1003) {
@@ -1675,11 +1722,10 @@ async function claimFor(acc, planId) {
   return { ok: false, msg: tried.at(-1)?.msg || '没有可领取的套餐', tried };
 }
 
-/** 可领取的 plan 列表（一键领取的前置）；停用号跳过 */
+/** 可领取的 plan 列表（一键领取的前置）；停用号保留领取资格，照常列出 */
 async function handleClaimable(req, res) {
   const out = [];
   for (const acc of accounts) {
-    if (acc.disabled) continue;
     try {
       const { plans, rawCode, rawMsg } = await claimableFor(acc);
       out.push({
@@ -1703,11 +1749,21 @@ async function handleClaim(req, res, labelOverride) {
   } catch {}
 
   const targetLabel = body.label || labelOverride;
-  const targets = targetLabel ? accounts.filter((a) => a.label === targetLabel) : accounts.filter((a) => !a.disabled);
+  // 上游 claim 强制阿里云人机验证：无验证参数时直接给出明确错误（前端负责跑 SDK 拿参数）
+  const captchaParam = String(body.captchaParam || body.captchaVerifyParam || '').trim();
+  if (!captchaParam) {
+    return sendJson(res, 200, {
+      results: [{ label: targetLabel ?? '(all)', ok: false, code: 'captcha_required', msg: '需要人机验证：请从面板「账号管理」的领取按钮发起（会自动完成无痕验证）' }],
+    });
+  }
+  // 一键领取只处理已启用账号；指定 label 时精确到号（停用号保留领取资格）
+  const targets = targetLabel
+    ? accounts.filter((a) => a.label === targetLabel)
+    : accounts.filter((a) => !a.disabled);
   const results = [];
   for (const acc of targets) {
     try {
-      results.push({ label: acc.label, ...(await claimFor(acc, body.planId)) });
+      results.push({ label: acc.label, ...(await claimFor(acc, body.planId, captchaParam)) });
     } catch (e) {
       results.push({ label: acc.label, ok: false, msg: e.message });
     }
@@ -2649,6 +2705,10 @@ async function handleConsoleApi(req, res, url) {
     }
     return sendJson(res, 200, { logs: rows.slice(offset, offset + limit), total: rows.length, limit, offset });
   }
+  // GET /api/captcha/config —— 前端阿里云验证码 SDK 初始化参数（对齐 zcode-switch claim_captcha_config）
+  if (req.method === 'GET' && p === '/api/captcha/config') {
+    return sendJson(res, 200, await captchaConfig());
+  }
   // GET /api/models
   if (req.method === 'GET' && p === '/api/models') {
     const models = [
@@ -2980,6 +3040,11 @@ server.listen(PORT, HOST, () => {
           });
           const j = await safeJson(r);
           const x = (j.results ?? [])[0] ?? {};
+          if (x.code === 'captcha_required') {
+            // 上游强制人机验证，服务端后台任务拿不到验证参数 —— 首轮提示一次即可
+            log('[weekend-grab] 上游 claim 需要人机验证（阿里云验证码），后台自动抢领已不可用；请从面板手动领取');
+            return;
+          }
           if (x.ok && !x.alreadyClaimed) log(`[weekend-grab] ${acc.label} 抢领成功：${x.claimed}`);
           else if (x.code === 1005) log(`[weekend-grab] ${acc.label} 1005 名额未开/已尽，下轮再试`);
         }

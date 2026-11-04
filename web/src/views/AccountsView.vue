@@ -394,7 +394,7 @@ async function batch(enabled: boolean) {
                     ? `在途 ${account.activeRequests} 个请求`
                     : account.enabled
                       ? account.lastError || '等待首次调用'
-                      : '已手动停用，请启用账号恢复'
+                      : '已停用调度 · 额度与领取不受影响'
                 }}
               </div>
             </td>
@@ -459,10 +459,10 @@ async function batch(enabled: boolean) {
               <div class="row-actions">
                 <button
                   class="icon-button"
-                  :disabled="busy.has(account.id) || !account.enabled"
+                  :disabled="busy.has(account.id)"
                   :aria-label="`自检${account.name}`"
                   :aria-busy="rowOps[account.id] === 'probe'"
-                  title="真实调用一次上游，验证连通"
+                  :title="account.enabled ? '真实调用一次上游，验证连通' : '账号已停用，启用后才能自检'"
                   @click="rowAction(account.id, 'probe')"
                 >
                   <LoaderCircle
