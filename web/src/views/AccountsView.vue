@@ -18,6 +18,7 @@ import {
   Check,
   X,
   ArrowRight,
+  ArrowUpRight,
   Zap,
   Layers,
   FilterX,
@@ -29,20 +30,20 @@ import {
   useConsole,
   accountState,
   number,
-  quotaPercent,
   time,
   strategyLabels,
   copy,
 } from '../console'
 import type { Account, Page } from '../types'
-import { formatRemainingQuotaPercent, summarizeQuota } from '../quota'
+import { summarizeQuota } from '../quota'
 import AccountDialog from '../components/AccountDialog.vue'
 import OnboardDialog from '../components/OnboardDialog.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import ModalShell from '../components/ModalShell.vue'
+import QuotaDetails from '../components/QuotaDetails.vue'
 
 const emit = defineEmits<{ navigate: [page: Page] }>()
-const { overview, accounts, loading, busy, refresh, action, setEnabled } = useConsole()
+const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts } = useConsole()
 const search = ref('')
 const tab = ref('all')
 const group = ref('all')
@@ -118,11 +119,11 @@ const totalToday = (id: string) => {
   )
 }
 const rowOps = ref<Record<string, 'probe' | 'quota' | undefined>>({})
-async function rowAction(id: string, operation: 'probe' | 'quota') {
+async function rowAction(id: string, operation: 'probe' | 'quota', planId?: string) {
   if (busy.value.has(id)) return
   rowOps.value[id] = operation
   try {
-    await action(id, operation)
+    await action(id, operation, planId)
   } finally {
     if (rowOps.value[id] === operation) delete rowOps.value[id]
   }
@@ -183,6 +184,10 @@ async function batch(enabled: boolean) {
       <button class="button token-shortcut" @click="emit('navigate', 'overview')">
         <Wallet :size="15" />用量统计
       </button>
+      <button class="button" :disabled="!!refreshProgress || !accounts.length" @click="refreshQualifications()">
+        <RefreshCw :size="15" :class="{ spin: !!refreshProgress }" />
+        {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '一键刷新资格' }}
+      </button>
       <button class="button" @click="startOnboard('zai')">
         <Cloud :size="15" />登录国际账号</button
       ><button class="button" @click="startOnboard('bigmodel')">
@@ -233,19 +238,11 @@ async function batch(enabled: boolean) {
     </div>
     <div class="stat-card">
       <div class="stat-top">
-        <span>剩余额度</span><span class="stat-icon amber"><Wallet :size="17" /></span>
+        <span>套餐额度</span><span class="stat-icon amber"><Wallet :size="17" /></span>
       </div>
-      <div class="stat-value">
-        {{ number(overview?.stats.remainingCredits, 1) }}<small>单位</small>
-        <small>{{ formatRemainingQuotaPercent(credits) }}</small>
-      </div>
+      <div class="stat-value">{{ credits.plans }}<small>个套餐</small></div>
       <div class="stat-bottom">
-        <span>{{
-          overview?.stats.quotaOrganizations
-            ? `${overview.stats.quotaOrganizations} 个账号有生效额度`
-            : '领取套餐后自动显示额度'
-        }}</span
-        ><ArrowRight :size="13" />
+        <span>{{ credits.organizations }} 个账号已查询 · 按套餐分别展示</span>
       </div>
     </div>
   </div>
@@ -399,45 +396,24 @@ async function batch(enabled: boolean) {
               </div>
             </td>
             <td class="quota-cell">
-              <template v-if="account.quota"
-                ><div class="quota-numbers">
-                  <strong>{{
-                    number(
-                      Math.max(
-                        0,
-                        account.quota.credits.total -
-                          account.quota.credits.used -
-                          account.quota.credits.freeze,
-                      ),
-                      1,
-                    )
-                  }}</strong
-                  ><span>/ {{ number(account.quota.credits.total) }}</span>
-                  <span class="quota-percentage">{{
-                    formatRemainingQuotaPercent(account.quota.credits)
-                  }}</span>
-                </div>
-                <div class="quota-track">
-                  <i
-                    :class="{ low: quotaPercent(account) > 85 }"
-                    :style="{ width: `${100 - quotaPercent(account)}%` }"
-                  />
-                </div>
-                <span
-                  class="quota-updated"
-                  :title="`套餐余额实时读取`"
-                  >各套餐余额合计</span
-                ></template
-              ><template v-else
-                ><span class="unsynced">— <small>暂无额度</small></span
-                ><button
-                  class="text-link small-link"
-                  :disabled="busy.has(account.id)"
-                  @click="rowAction(account.id, 'quota')"
-                >
-                  领取额度<ArrowUpRight :size="11" /></button
-                ></template
-              >
+              <QuotaDetails :sources="account.quotaSources || []" />
+              <div class="eligibility-status">
+                <button class="text-link small-link" :disabled="!!refreshProgress"
+                  @click="refreshQualifications([account.id])">
+                  <RefreshCw :size="12" :class="{ spin: refreshingAccounts.has(account.id) }" />刷新资格与额度
+                </button>
+                <span v-if="!account.eligibility" class="quota-sync-state">领取资格尚未查询</span>
+                <template v-else>
+                  <span v-if="account.eligibility.error" class="quota-sync-state error">{{ account.eligibility.error }}</span>
+                  <span v-if="account.eligibility.status === 'ready' && !account.eligibility.plans.length" class="quota-sync-state">暂无可领取套餐</span>
+                  <button v-for="plan in account.eligibility.plans" :key="plan.planId"
+                    class="text-link small-link" :title="plan.description || plan.planId"
+                    :disabled="busy.has(account.id)" @click="rowAction(account.id, 'quota', plan.planId)">
+                    <Zap :size="12" />领取 {{ plan.name }}
+                  </button>
+                  <span class="quota-updated">资格查询于 {{ time(account.eligibility.checkedAt, true) }}</span>
+                </template>
+              </div>
             </td>
             <td>
               <span class="request-number">{{ number(totalToday(account.id)) }}</span>

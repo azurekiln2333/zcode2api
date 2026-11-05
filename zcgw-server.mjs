@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { normalizeBilling, normalizeCoding } from './zcgw-quota.mjs';
 import { metadataUserId, sessionIdFor, requestId, userIdFromJwt, deviceIdFor } from './zcgw-fingerprint.mjs';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
@@ -53,6 +54,7 @@ const PROFILE_FILE = path.join(import.meta.dirname, 'zcode-profile.json');
 const DATA_DIR = process.env.ZCGW_DATA_DIR || import.meta.dirname;
 
 const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+const GATEWAY_VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 const SESSION_ID = `session_${crypto.randomBytes(16).toString('hex')}`;
 
 /** 把 plan_id / plan 名译成中文意图（活动包 / 每日免费 / 付费套餐） */
@@ -334,6 +336,9 @@ function readAccountFile() {
         realmZh: REALM_ZH[realm],
         identity: displayIdentity({ email: a.email, phone: a.phone, realm }),
         hasAccessToken: !!a.zaiAccessToken,
+        zaiAccessToken: a.zaiAccessToken || null,
+        codingPlanApiKey: a.codingPlanApiKey || null,
+        codingPlanProvider: a.codingPlanProvider || (realm === 'cn' ? 'bigmodel' : 'zai'),
         weight: Number(a.weight) || 1,
         disabled: !!a.disabled, // 手动停用：不参与调度（区别于 weight=0 的软暂停）
         // 指纹按账号派生：同号恒定、跨号隔离（见 zcgw-fingerprint.mjs）
@@ -556,13 +561,16 @@ function stickyUnbind(key) {
  *   weight = 余额占比 ×10 + 闲置补偿 + 成功率 ×3
  * 余额来自最近一次 /quota 的缓存（quotaCache），没有就用中性值。
  */
-let quotaCache = new Map(); // label -> { remaining, total, ts }
+let quotaCache = new Map(); // Billing totals for scheduling only; UI uses separate sources.
+const quotaSources = new Map();
+const eligibilityCache = new Map();
+const accountRefreshes = new Map();
 function setQuotaCache(list) {
   for (const a of list) {
-    if (!a.label) continue;
+    if (!a.label || a.error) continue;
     const rem = (a.balances ?? []).reduce((s, b) => s + (b.remaining || 0), 0);
     const tot = (a.balances ?? []).reduce((s, b) => s + (b.total || 0), 0);
-    quotaCache.set(a.label, { remaining: rem, total: tot, ts: Date.now() });
+    quotaCache.set(a.label, { remaining: rem, total: tot, plans: a.plans || [], balances: a.balances || [], ts: Date.now() });
   }
 }
 
@@ -1007,7 +1015,7 @@ function recordUsage(req, rec) {
   try {
     fs.appendFileSync(USAGE_FILE, JSON.stringify(rec) + '\n');
   } catch {}
-  
+
   // 同步累到密钥头上
   if (rec.keyId) {
     const k = keyDb.keys.find((x) => x.id === rec.keyId);
@@ -1464,79 +1472,87 @@ function handlePool(req, res) {
   });
 }
 
-/** 逐号查余额（billing/balance），同时喂给选号权重缓存。
- *  停用号也照常查：停用只退出调度，额度展示与领取资格不受影响。 */
+/** Read-only quota refresh; disabled accounts keep their own quota visibility. */
 async function handleQuota(req, res) {
   const out = [];
   for (const acc of accounts) {
-    try {
-      const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, {
-        headers: upstreamHeaders(acc),
-        signal: AbortSignal.timeout(20000),
-      });
-      const j = await safeJson(r);
-      const d = j.data ?? {};
-      out.push({
-        label: acc.label,
-        userId: acc.uid,
-        email: acc.email,
-        name: acc.name,
-        identity: acc.identity,
-        realm: acc.realm,
-        realmZh: acc.realmZh,
-        plans: (d.plans ?? []).map((p) => {
-          const dp = describePlan(p.plan_id, p.name);
-          return {
-            id: p.plan_id,
-            name: p.name,
-            nameZh: dp.nameZh,
-            kind: dp.kind,
-            kindZh: dp.kindZh,
-            status: p.status,
-            endsAt: p.ends_at,
-          };
-        }),
-        balances: (d.balances ?? []).map((b) => {
-          const db = describePlan(b.plan_id, b.show_name);
-          return {
-            model: b.show_name,
-            kind: db.kind,
-            kindZh: db.kindZh,
-            typeZh: `${db.kindZh} · ${b.show_name}`,
-            remaining: b.remaining_units,
-            total: b.total_units,
-            periodEnd: b.period_end,
-          };
-        }),
-        error: j.code !== 0 ? j : undefined,
-      });
-    } catch (e) {
-
-      out.push({ label: acc.label, error: e.message });
-    }
+    await refreshQuotaAccount(acc);
+    const cached = quotaCache.get(acc.label);
+    const source = quotaSources.get(acc.label)?.billing;
+    out.push({ label: acc.label, plans: (cached?.plans || []).map((p) => ({ ...p, endsAt: p.endsAt ? Date.parse(p.endsAt) / 1000 : null })), balances: (cached?.balances || []).map((b) => ({ ...b, periodEnd: b.periodEnd ? Date.parse(b.periodEnd) / 1000 : null })), error: source?.error || undefined });
   }
-  setQuotaCache(out);
   sendJson(res, 200, { accounts: out });
+}
+
+async function quotaJson(url, headers) {
+  const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  const j = await safeJson(r);
+  if (!r.ok || j.__error || j.success === false || ![0, 200, '0', '200'].includes(j.code)) {
+    // Never echo upstream payloads, which may contain credentials or personal data.
+    throw new Error(`查询失败（HTTP ${r.status}，业务码 ${Number(j.code) || '未知'}）`);
+  }
+  if (!j.data || typeof j.data !== 'object') throw new Error('查询响应缺少 data');
+  return j.data;
+}
+
+function sourceName(acc, id) {
+  return id === 'billing' ? 'ZCode 套餐' : `${acc.codingPlanProvider === 'bigmodel' ? 'BigModel' : 'Z.ai'} Coding Plan`;
+}
+
+async function refreshQuotaSource(acc, id) {
+  const key = `${acc.label}:${id}`;
+  if (accountRefreshes.has(key)) return accountRefreshes.get(key);
+  const run = (async () => {
+    const previous = quotaSources.get(acc.label)?.[id];
+    const base = { id, name: sourceName(acc, id), plans: previous?.plans || [], syncedAt: previous?.syncedAt || null };
+    let source;
+    try {
+      let plans;
+      if (id === 'billing') {
+        const q = await quotaOf(acc);
+        plans = q.plans;
+        setQuotaCache([{ label: acc.label, ...q }]);
+      } else {
+        // The stored OAuth token belongs to Z.ai; never send it to a different provider.
+        const token = acc.codingPlanApiKey || (acc.codingPlanProvider !== 'bigmodel' ? acc.zaiAccessToken : null);
+        if (!token) {
+          source = { ...base, plans: [], syncedAt: null, status: 'unconfigured', error: '未接入查询：请在编辑账号中配置 Coding Plan API Key' };
+        } else {
+          const origin = acc.codingPlanProvider === 'bigmodel'
+            ? (process.env.ZCODE_BIGMODEL_ORIGIN || 'https://open.bigmodel.cn') : ZAI_ORIGIN;
+          const data = await quotaJson(`${origin}/api/monitor/usage/quota/limit`, { authorization: `Bearer ${token}`, accept: 'application/json' });
+          if (!Array.isArray(data.limits)) throw new Error('额度响应缺少 limits');
+          plans = normalizeCoding(data);
+        }
+      }
+      source ||= { ...base, plans, syncedAt: new Date().toISOString(), status: 'ready', error: null };
+    } catch (e) {
+      source = { ...base, status: 'error', error: `${e.message}${id === 'coding' && !acc.codingPlanApiKey ? '；可在编辑账号中配置对应平台的 Coding Plan API Key' : ''}` };
+    }
+    quotaSources.set(acc.label, { ...quotaSources.get(acc.label), [id]: source });
+    return source;
+  })();
+  accountRefreshes.set(key, run);
+  try { return await run; } finally { accountRefreshes.delete(key); }
+}
+
+async function refreshQuotaAccount(acc) {
+  return Promise.all(['billing', 'coding'].map((id) => refreshQuotaSource(acc, id)));
 }
 
 /** 可领取的 plan 列表 + 候选 id（preview 为空时用来兑底） */
 async function claimableFor(acc) {
-  const r = await fetch(
+  const data = await quotaJson(
     `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=win32-x64`,
-    { headers: upstreamHeaders(acc), signal: AbortSignal.timeout(20000) },
+    upstreamHeaders(acc),
   );
-  const j = await safeJson(r);
-  const plans = (j.data?.plans ?? []).map((p) => ({
-    planId: p.plan_id,
-    name: p.name,
-    description: p.description,
-    entitlements: (p.entitlements ?? []).map((e) => ({
-      model: e.show_name,
-      grant: e.grant_units,
-      period: e.period,
-    })),
-  }));
-  return { plans, rawCode: j.code ?? (j.__error ? -1 : 0), rawMsg: j.msg ?? j.__error ?? '' };
+  if (!Array.isArray(data.plans)) throw new Error('资格响应缺少 plans');
+  const plans = data.plans.map((p) => ({
+    planId: String(p.plan_id || ''), name: String(p.name || p.plan_id || ''),
+    description: String(p.description || ''),
+    entitlements: (p.entitlements || []).map((e) => ({ model: e.show_name, grant: e.grant_units, period: e.period })),
+  })).filter((p) => p.planId);
+  return { plans, rawCode: 0, rawMsg: '' };
 }
 
 // ── 领取资格：双通道（对齐 zcode-switch）──
@@ -1561,32 +1577,44 @@ function collectClaimButtons(v, out) {
   }
 }
 
-/** marketing/touch 通道：返回可领 planId 列表（失败静默为空 —— 通道缺失不算故障） */
+/** Both channels are queried independently; failure is not an empty eligibility result. */
 async function marketingClaimableIds(acc) {
-  try {
-    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/marketing/touch?seq=0`, {
-      headers: upstreamHeaders(acc),
-      signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
-    });
-    if (!r.ok) return [];
-    const j = await safeJson(r);
-    if ((j.code ?? -1) !== 0) return [];
-    const ids = [];
-    for (const d of j.data?.deliveries ?? []) collectClaimButtons(d, ids);
-    return [...new Set(ids)];
-  } catch {
-    return [];
-  }
+  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/marketing/touch?seq=0`, upstreamHeaders(acc));
+  if (!Array.isArray(data.deliveries)) throw new Error('活动响应缺少 deliveries');
+  const ids = [];
+  for (const d of data.deliveries) collectClaimButtons(d, ids);
+  return [...new Set(ids)];
 }
 
-/** 合并 preview + marketing 双通道的可领套餐（marketing 只补按钮 id，preview 优先） */
+async function refreshEligibility(acc) {
+  const key = `${acc.label}:eligibility`;
+  if (accountRefreshes.has(key)) return accountRefreshes.get(key);
+  const run = (async () => {
+    const results = await Promise.allSettled([claimableFor(acc), marketingClaimableIds(acc)]);
+    const plans = new Map();
+    const errors = [];
+    if (results[0].status === 'fulfilled') {
+      for (const p of results[0].value.plans) plans.set(p.planId, p);
+    } else errors.push(`套餐资格：${results[0].reason.message}`);
+    if (results[1].status === 'fulfilled') {
+      for (const id of results[1].value) if (!plans.has(id)) plans.set(id, { planId: id, name: id, description: '', entitlements: [] });
+    } else errors.push(`活动资格：${results[1].reason.message}`);
+    const state = {
+      status: errors.length === 2 ? 'error' : errors.length ? 'partial' : 'ready',
+      plans: [...plans.values()], checkedAt: new Date().toISOString(), error: errors.join('；') || null,
+    };
+    eligibilityCache.set(acc.label, state);
+    return state;
+  })();
+  accountRefreshes.set(key, run);
+  try { return await run; } finally { accountRefreshes.delete(key); }
+}
+
 async function claimCandidates(acc, planId) {
   if (planId) return [planId];
-  const { plans } = await claimableFor(acc);
-  const ids = plans.map((p) => p.planId);
-  const extra = await marketingClaimableIds(acc);
-  for (const id of extra) if (!ids.includes(id)) ids.push(id);
-  return ids;
+  const state = await refreshEligibility(acc);
+  if (state.status === 'error') throw new Error(state.error);
+  return state.plans.map((p) => p.planId);
 }
 
 // ── 阿里云验证码配置（claim 必带 X-Aliyun-Captcha-Verify-Param，否则 3007）──
@@ -1627,15 +1655,7 @@ async function activeGrants(acc) {
   }
 }
 
-/**
- * 领取：preview 里有就用 preview，没有就试当天的活动包 id。
- * 活动包 id 有日期编码（例：zcode-v3-start-plan-1030-wk = 10月30日周末）。
- * 关键：北京时间 0 点会跳日，所以候选要跨 ±1 天，不能只算当天。
- *
- * 修正过的重点：以前只要有一个「活动大包」就在效，就直接 return alreadyClaimed，
- * 结果永远不去领每日体验包（-0817），导致某些号只有周末包、没有每日额度。
- * 现在改成「按额度类型（kind）分别判断缺哪个，只补缺的那一类」。
- */
+/** Discover candidates from preview and marketing; one captcha authorizes one claim. */
 async function claimFor(acc, planId, captchaParam) {
   if (!captchaParam || !captchaParam.trim()) {
     // 上游 claim 已强制阿里云人机验证（3007 captcha verify failed），无验证参数直接拒绝，
@@ -1703,7 +1723,7 @@ async function claimFor(acc, planId, captchaParam) {
       ok: true,
       claimed: claimed.map((c) => c.planId).join(', '),
       claimedList: claimed.map((c) => c.planId),
-      expired: dup.map((d) => d.planId),
+      alreadyClaimedPlans: dup.map((d) => d.planId),
       tried,
     };
   }
@@ -1722,20 +1742,12 @@ async function claimFor(acc, planId, captchaParam) {
   return { ok: false, msg: tried.at(-1)?.msg || '没有可领取的套餐', tried };
 }
 
-/** 可领取的 plan 列表（一键领取的前置）；停用号保留领取资格，照常列出 */
+/** Legacy endpoint shares the same eligibility result as the console. */
 async function handleClaimable(req, res) {
   const out = [];
   for (const acc of accounts) {
-    try {
-      const { plans, rawCode, rawMsg } = await claimableFor(acc);
-      out.push({
-        label: acc.label,
-        claimable: plans,
-        raw: rawCode !== 0 || plans.length === 0 ? { code: rawCode, msg: rawMsg } : undefined,
-      });
-    } catch (e) {
-      out.push({ label: acc.label, error: e.message });
-    }
+    const state = await refreshEligibility(acc);
+    out.push({ label: acc.label, claimable: state.plans, ...state });
   }
   sendJson(res, 200, { accounts: out });
 }
@@ -1748,7 +1760,7 @@ async function handleClaim(req, res, labelOverride) {
     body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
   } catch {}
 
-  const targetLabel = body.label || labelOverride;
+  const targetLabel = labelOverride || body.label;
   // 上游 claim 强制阿里云人机验证：无验证参数时直接给出明确错误（前端负责跑 SDK 拿参数）
   const captchaParam = String(body.captchaParam || body.captchaVerifyParam || '').trim();
   if (!captchaParam) {
@@ -1763,7 +1775,9 @@ async function handleClaim(req, res, labelOverride) {
   const results = [];
   for (const acc of targets) {
     try {
-      results.push({ label: acc.label, ...(await claimFor(acc, body.planId, captchaParam)) });
+      const result = await claimFor(acc, body.planId, captchaParam);
+      results.push({ label: acc.label, ...result });
+      if (result.ok) await Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]);
     } catch (e) {
       results.push({ label: acc.label, ok: false, msg: e.message });
     }
@@ -1800,37 +1814,17 @@ const pendingFlows = readFlows(); // flowId -> { pollToken, createdAt }
 
 /** 读某个账号的余额（统一格式，带中文标签） */
 async function quotaOf(acc) {
-  const q = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, {
-    headers: upstreamHeaders(acc),
-    signal: AbortSignal.timeout(20000),
+  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, upstreamHeaders(acc));
+  if (!Array.isArray(data.plans) || !Array.isArray(data.balances)) throw new Error('套餐余额响应缺少 plans / balances');
+  const plans = normalizeBilling(data).map((p) => {
+    const d = describePlan(p.id, p.name);
+    return { ...p, nameZh: p.name, kind: d.kind, kindZh: d.kindZh };
   });
-  const qj = await safeJson(q);
-  return {
-    plans: (qj.data?.plans ?? []).map((p) => {
-      const d = describePlan(p.plan_id, p.name);
-      return {
-        id: p.plan_id,
-        name: p.name,
-        nameZh: d.nameZh,
-        kind: d.kind,
-        kindZh: d.kindZh,
-        status: p.status,
-        endsAt: p.ends_at,
-      };
-    }),
-    balances: (qj.data?.balances ?? []).map((b) => {
-      const d = describePlan(b.plan_id, b.show_name);
-      return {
-        model: b.show_name,
-        kind: d.kind,
-        kindZh: d.kindZh,
-        typeZh: `${d.kindZh} · ${b.show_name}`,
-        remaining: b.remaining_units,
-        total: b.total_units,
-        periodEnd: b.period_end,
-      };
-    }),
-  };
+  const balances = plans.flatMap((p) => p.items.map((item) => ({
+    planId: p.id, model: item.name, kind: p.kind, kindZh: p.kindZh, typeZh: `${p.name} · ${item.name}`,
+    remaining: item.remaining, total: item.total, periodEnd: item.resetAt,
+  })));
+  return { plans, balances };
 }
 
 /** 手动添加：POST { jwt, label?, email?, accessToken? } —— flow 丢了或想直接粘贴 token 时用 */
@@ -2492,7 +2486,7 @@ function serveConsoleStatic(req, res, pathname) {
 
 function accountQuotaSnapshot(a) {
   const qc = quotaCache.get(a.label);
-  if (!qc || !qc.total) return null;
+  if (!qc) return null;
   const total = Number(qc.total) || 0;
   const remaining = Math.max(0, Number(qc.remaining) || 0);
   const used = Math.max(0, total - remaining);
@@ -2605,7 +2599,13 @@ function buildOverview() {
       latencyMs: null,
       lastError: a.lastErr || '',
       quota: accountQuotaSnapshot(a),
-      plans: (a.plans ?? []).map((p) => ({ id: p.id, name: p.name, nameZh: p.nameZh, kind: p.kind, kindZh: p.kindZh, status: p.status, endsAt: p.endsAt })),
+      quotaSources: ['billing', 'coding'].map((id) => quotaSources.get(a.label)?.[id] || {
+        id, name: sourceName(a, id), status: 'pending', plans: [], syncedAt: null, error: null,
+      }),
+      eligibility: eligibilityCache.get(a.label) || null,
+      hasCodingPlanKey: !!a.codingPlanApiKey,
+      codingPlanProvider: a.codingPlanProvider || (a.realm === 'cn' ? 'bigmodel' : 'zai'),
+      plans: (quotaCache.get(a.label)?.plans || []).filter((p) => p.status === 'active'),
       requests: u.requests,
       errors: u.errors,
       activeRequests: a.inFlight || 0,
@@ -2745,10 +2745,16 @@ async function handleConsoleApi(req, res, url) {
     return sendJson(res, 200, { key: GATEWAY_KEY });
   }
   // PATCH /api/accounts/:id —— 启用停用 + 身份字段
-  const mAcc = p.match(/^\/api\/accounts\/(.+?)(?:\/(selftest|claim))?$/);
+  const mAcc = p.match(/^\/api\/accounts\/(.+?)(?:\/(selftest|claim|refresh))?$/);
   if (mAcc) {
     const id = decodeURIComponent(mAcc[1]);
     const sub = mAcc[2];
+    if (sub === 'refresh' && req.method === 'POST') {
+      const acc = accounts.find((a) => a.label === id);
+      if (!acc) return sendJson(res, 404, { error: '找不到账号' });
+      const [sources, eligibility] = await Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]);
+      return sendJson(res, 200, { quotaSources: sources, eligibility });
+    }
     if (sub === 'selftest' && req.method === 'POST') {
       const acc = accounts.find((a) => a.label === id);
       if (!acc) return sendJson(res, 404, { ok: false, error: `找不到账号 ${id}` });
@@ -2786,6 +2792,11 @@ async function handleConsoleApi(req, res, url) {
       const arr = fs.existsSync(ACC_FILE) ? JSON.parse(fs.readFileSync(ACC_FILE, 'utf8')) : [];
       const target = arr.find((a) => (a.label || '') === id);
       if (!target) return sendJson(res, 404, { error: `找不到账号 ${id}` });
+      if (body.codingPlanApiKey !== undefined) {
+        if (typeof body.codingPlanApiKey !== 'string' || body.codingPlanApiKey.length > 4096) return sendJson(res, 400, { error: 'Coding Plan API Key 格式不正确' });
+        target.codingPlanApiKey = body.codingPlanApiKey.trim();
+      }
+      if (body.codingPlanProvider === 'zai' || body.codingPlanProvider === 'bigmodel') target.codingPlanProvider = body.codingPlanProvider;
       if (body.enabled !== undefined) target.disabled = !body.enabled;
       const email = String(body.email || '').trim();
       if (email) {
@@ -2800,7 +2811,21 @@ async function handleConsoleApi(req, res, url) {
         target.weight = Number.isFinite(w) ? Math.max(0, Math.min(20, w)) : 1;
       }
       fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
-      accounts = readAccountFile();
+      // Editing quota credentials must not reset scheduler cooldowns or in-flight counts.
+      const previousAccounts = new Map(accounts.map((a) => [a.label, a]));
+      accounts = readAccountFile().map((a) => {
+        const previous = previousAccounts.get(a.label);
+        if (!previous) return a;
+        const runtime = Object.fromEntries(['cooldownUntil', 'failures', 'consecutiveFails', 'inFlight', 'degradeUntil', 'lastSuccess', 'lastErr'].map((field) => [field, previous[field]]));
+        return Object.assign(previous, a, runtime);
+      });
+      if (body.codingPlanApiKey !== undefined || body.codingPlanProvider !== undefined) {
+        const acc = accounts.find((a) => a.label === id);
+        await accountRefreshes.get(`${id}:coding`);
+        const sources = quotaSources.get(id);
+        if (sources) delete sources.coding;
+        await refreshQuotaSource(acc, 'coding');
+      }
       return sendJson(res, 200, { ok: true, account: id });
     }
   }
@@ -2868,6 +2893,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/health') {
     return sendJson(res, 200, {
       ok: true,
+      version: GATEWAY_VERSION,
       accounts: accounts.length,
       keys: keyDb.keys.filter((k) => !k.deleted).length,
       upstream: UPSTREAM_URL,
@@ -3007,8 +3033,7 @@ server.listen(PORT, HOST, () => {
   loadPoolState();
   const refreshQuotaWeights = async () => {
     try {
-      const r = await fetch(`http://127.0.0.1:${PORT}/quota`);
-      await r.json();
+      for (const acc of accounts) await refreshQuotaAccount(acc);
     } catch {}
   };
   setTimeout(refreshQuotaWeights, 3000);

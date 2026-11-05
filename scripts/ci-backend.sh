@@ -8,6 +8,9 @@ echo "==> node $(node --version)"
 echo "==> 语法检查"
 node --check zcgw-server.mjs
 node --check zcgw-fingerprint.mjs
+node --check zcgw-quota.mjs
+node scripts/check-version.mjs
+node --test tests/*.test.mjs
 
 echo "==> 冷启动冒烟（空数据目录）"
 DATA_DIR="$(mktemp -d)"

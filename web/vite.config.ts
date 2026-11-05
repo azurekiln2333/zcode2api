@@ -1,18 +1,13 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 
 const consolePackage = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
 const rootPath = new URL('../package.json', import.meta.url)
-let version = consolePackage.version
-if (existsSync(rootPath)) {
-  // 源码开发时：与根 package.json 保持版本一致
-  const project = JSON.parse(readFileSync(rootPath, 'utf8'))
-  if (project.version !== consolePackage.version)
-    throw new Error('Console package version must match the root package version')
-} else {
-  // Docker 多阶段构建只携带 web/ 目录：以 web/package.json 版本为准
-}
+const project = JSON.parse(readFileSync(rootPath, 'utf8'))
+if (project.version !== consolePackage.version)
+  throw new Error('Console package version must match the root package version')
+const version = project.version
 
 export default defineConfig({
   plugins: [vue()],

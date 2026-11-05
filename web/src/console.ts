@@ -1,7 +1,7 @@
 import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
 import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
-import type { Account, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
+import type { Account, AccountRefresh, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
 
 const overview = ref<Overview | null>(null)
 const logs = ref<LogEntry[]>([])
@@ -17,6 +17,8 @@ const refreshError = ref('')
 const refreshDiagnostics = ref<ApiDiagnostics | null>(null)
 const lastUpdated = ref<Date | null>(null)
 const busy = ref(new Set<string>())
+const refreshingAccounts = ref(new Set<string>())
+const refreshProgress = ref<{ done: number; total: number } | null>(null)
 const toasts = ref<{ id: number; text: string; error: boolean; diagnostics?: ApiDiagnostics }[]>([])
 const registration = ref<{ account: Account; token: string } | null>(null)
 let notificationId = 0
@@ -34,6 +36,8 @@ function reset() {
   refreshDiagnostics.value = null
   loading.value = false
   refreshPromise = null
+  refreshingAccounts.value.clear()
+  refreshProgress.value = null
   delete logsRequests.requests
   logQueries.requests.value = emptyLogQuery()
   logPages.requests.value = { total: 0, loading: false }
@@ -132,7 +136,7 @@ async function refreshLogs(channel: LogChannel = 'requests', query = logQueries[
  * 账号行内操作：probe → 网关自检（真实走一次上游推理），quota → 领取套餐额度。
  * 领取前先跑阿里云人机验证（上游 claim 强制），3007 时自动换新验证参数重试一轮。
  */
-async function action(id: string, operation: 'probe' | 'quota') {
+async function action(id: string, operation: 'probe' | 'quota', planId?: string) {
   if (busy.value.has(id)) return
   busy.value.add(id)
   try {
@@ -163,7 +167,7 @@ async function action(id: string, operation: 'probe' | 'quota') {
         const result = await api<{ results?: Array<{ ok: boolean; alreadyClaimed?: boolean; expired?: boolean; claimed?: string; msg?: string; code?: number | string }> }>(
           `/accounts/${encodeURIComponent(id)}/claim`,
           'POST',
-          { captchaParam: param },
+          { captchaParam: param, planId },
         )
         last = (result.results ?? [])[0]
         if (last?.code === 3007) {
@@ -178,6 +182,7 @@ async function action(id: string, operation: 'probe' | 'quota') {
       else if (x.ok && x.alreadyClaimed) notify('额度已在生效中，无需重复领取')
       else if (x.ok) notify(`已成功领取 ${x.claimed ?? '额度'}`)
       else notify(x.msg || '当前不在可领取窗口', true)
+      await refreshAccount(id)
     }
     await refresh()
   } catch (error) {
@@ -189,6 +194,49 @@ async function action(id: string, operation: 'probe' | 'quota') {
     )
   } finally {
     busy.value.delete(id)
+  }
+}
+
+async function refreshAccount(id: string) {
+  const result = await api<AccountRefresh>(`/accounts/${encodeURIComponent(id)}/refresh`, 'POST', {})
+  return result
+}
+
+/** Limit upstream concurrency and keep per-account failures visible. */
+async function refreshQualifications(ids?: string[]) {
+  if (refreshProgress.value) return
+  const targets = ids ?? overview.value?.accounts.map((a) => a.id) ?? []
+  const generation = sessionGeneration
+  refreshProgress.value = { done: 0, total: targets.length }
+  let failures = 0
+  let next = 0
+  const worker = async () => {
+    while (next < targets.length && generation === sessionGeneration) {
+      const id = targets[next++]!
+      refreshingAccounts.value.add(id)
+      try {
+        const result = await refreshAccount(id)
+        if (result.eligibility.status !== 'ready' || result.quotaSources.some((s) => s.status === 'error')) failures++
+      } catch (error) {
+        failures++
+        if (generation === sessionGeneration) notify(`${id}：${error instanceof Error ? error.message : '刷新失败'}`, true)
+      } finally {
+        if (generation === sessionGeneration) {
+          refreshingAccounts.value.delete(id)
+          if (refreshProgress.value) refreshProgress.value.done++
+        }
+      }
+    }
+  }
+  try {
+    await Promise.all([worker(), worker()])
+    if (generation !== sessionGeneration) return
+    // Wait for any earlier poll before requesting the updated snapshots.
+    if (refreshPromise) await refreshPromise
+    await refresh()
+    notify(`已刷新 ${targets.length} 个账号${failures ? `，${failures} 个存在查询失败，请查看明细` : '的资格和额度'}`, failures > 0)
+  } finally {
+    if (generation === sessionGeneration) refreshProgress.value = null
   }
 }
 
@@ -320,6 +368,9 @@ export function useConsole() {
     refreshDiagnostics,
     lastUpdated,
     busy,
+    refreshingAccounts,
+    refreshProgress,
+    refreshQualifications,
     toasts,
     registration,
     accounts: computed(() => overview.value?.accounts ?? []),

@@ -13,10 +13,11 @@ import {
 } from '@lucide/vue'
 import { number, compact, useConsole, accountState, time } from '../console'
 import { abbreviateCount } from '../format'
-import { formatRemainingQuotaPercent, summarizeQuota } from '../quota'
+import { summarizeQuota } from '../quota'
 import type { TokenTotals } from '../types'
+import QuotaDetails from '../components/QuotaDetails.vue'
 const emit = defineEmits<{ navigate: [page: 'accounts'] }>()
-const { overview, accounts, lastUpdated } = useConsole()
+const { overview, accounts, lastUpdated, refreshQualifications, refreshProgress } = useConsole()
 const tokenPeriod = ref<'today' | 'total'>('today')
 const credits = computed(() => summarizeQuota(accounts.value))
 const tokens = computed(() => overview.value?.stats.tokenUsage?.[tokenPeriod.value])
@@ -33,8 +34,8 @@ const tokenSummaryStatus = computed(() => {
   return `${number(usage.reportedRequests)} 次请求已计入统计。`
 })
 const creditSummaryStatus = computed(() => {
-  if (!credits.value.organizations) return '纳管账号并领取套餐后，这里会显示额度。'
-  return `已读取 ${credits.value.organizations} 个账号的套餐额度 · 每 15 秒同步`
+  if (!credits.value.organizations) return '点击刷新资格，读取各账号的套餐额度。'
+  return `已读取 ${credits.value.organizations} 个账号的套餐额度 · 后台每 10 分钟查询`
 })
 const tokenMetrics = [
   { key: 'input', label: '输入 Tokens', hint: '包含缓存读取与写入' },
@@ -153,32 +154,19 @@ const states = computed(() => [
         <span class="stat-icon amber"><Wallet :size="19" /></span>
       </div>
       <div class="overview-summary-value">
-        <strong>{{ number(overview?.stats.remainingCredits, 1) }}</strong
-        ><span>单位</span>
-        <span>{{ formatRemainingQuotaPercent(credits) }}</span>
+        <strong>{{ credits.plans }}</strong><span>个套餐 · {{ credits.organizations }} 个账号</span>
       </div>
-      <dl class="overview-summary-breakdown">
-        <div>
-          <dt>已使用</dt>
-          <dd>{{ number(credits.used, 1) }}</dd>
-        </div>
-        <div>
-          <dt>总额度</dt>
-          <dd>{{ number(credits.total, 1) }}</dd>
-        </div>
-        <div>
-          <dt>冻结额度</dt>
-          <dd>{{ number(credits.freeze, 1) }}</dd>
-        </div>
-        <div>
-          <dt>有额度账号</dt>
-          <dd>{{ number(credits.organizations) }}</dd>
-        </div>
-      </dl>
+      <button class="text-link" :disabled="!!refreshProgress || !accounts.length" @click="refreshQualifications()">
+        {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '刷新资格与额度' }}
+      </button>
+      <div class="overview-quota-list">
+        <details v-for="account in accounts" :key="account.id">
+          <summary>{{ account.name }}</summary>
+          <QuotaDetails :sources="account.quotaSources || []" />
+        </details>
+      </div>
       <p class="overview-summary-state">{{ creditSummaryStatus }}</p>
-      <p class="overview-summary-note">
-        {{ credits.syncedAt ? `额度更新于 ${time(credits.syncedAt, true)}` : '按套餐余额实时汇总。' }}
-      </p>
+      <p class="overview-summary-note">{{ credits.errors ? `${credits.errors} 个来源查询失败，请查看账号明细` : '各来源、套餐、模型与周期分别展示' }}</p>
     </section>
   </div>
   <div class="stats-grid">

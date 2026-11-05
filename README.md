@@ -221,7 +221,9 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 | `POST` | `/v1/messages` | 网关密钥 | Anthropic Messages API 兼容（流式 SSE / 非流式） |
 | `POST` | `/v1/chat/completions` | 网关密钥 | OpenAI Chat Completions 兼容（非流式整体返回） |
 | `GET` | `/v1/models` | 无 | 模型列表（`?api=anthropic` 切换 Anthropic 风格） |
-| `GET` | `/health` | 无 | 存活探测（含账号/密钥计数） |
+| `GET` | `/health` | 无 | 存活探测（含应用版本、账号/密钥计数） |
+| `GET` | `/api/overview` | 面板 | 账号、按来源和套餐区分的额度快照、最近领取资格 |
+| `POST` | `/api/accounts/{id}/refresh` | 面板 | 查询该账号的余额及 preview / marketing 双通道领取资格，停用账号也可查询 |
 | `GET` | `/pool` `/quota` `/keys` `/stats` `/logs` `/security` `/pool/settings` | 面板 | 管理面板后端 |
 | `POST` | `/claim` `/pool/reset` `/selftest` | 面板 | 领取额度 / 解除冷却 / 连通自检 |
 | `POST` | `/accounts/add` `/accounts/update` `/accounts/identify` | 面板 | 账号纳管 / 修改 / 身份识别 |
@@ -230,6 +232,19 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 | `GET/POST` | `/security` `/security/clear-blocked` | 面板 | IP 管控规则与审计 |
 
 > 上游对接：所有 `/v1/*` 请求最终转发至 `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`（免费额度通道），转发前完成密钥鉴权 → IP 管控 → 账号派生指纹 → 协议转换。
+
+### 额度和领取资格
+
+账号池的「一键刷新资格」会逐批查询全部账号的余额和可领取套餐；每个账号也可单独刷新。刷新只查询，领取时仍需点击对应套餐并完成人机验证。
+
+- **ZCode 套餐**：查询 `zcode.z.ai/api/v1/zcode-plan/billing/balance`，按上游返回的套餐、模型分别显示余额及重置时间。
+- **Z.ai / BigModel Coding Plan**：查询对应平台的 `/api/monitor/usage/quota/limit`，各时间窗口单独展示。在「编辑账号」中设置查询平台及对应的 Coding Plan API Key。Z.ai 未填写 API Key 时会尝试已有的 Z.ai 登录凭证；查询权限不足时显示错误，可改用 API Key。
+- 缺少凭证显示「未接入查询」；失败时保留上次成功数据并显示错误与更新时间；未知的额度显示 `—`。不同来源、套餐或周期不合成一条进度条。
+- 后台每 10 分钟刷新余额，设置 `PANEL_KEY` 后仍正常运行。面板每 15 秒读取快照；需要立即查询上游时使用刷新资格按钮。
+
+API Key 保存在数据目录的 `accounts.json`，面板只返回是否已配置。领取资格同时查询 preview 和 marketing；任一通道失败会单独提示，避免把失败误报为「无可领取套餐」。
+
+发布前同步根 `package.json`、`web/package.json` 和锁文件版本。`node scripts/check-version.mjs` 与 CI 会校验一致性及发布标签；Docker 构建也会校验前后端版本。升级后可用 `/health` 的 `version` 核对容器实际版本。
 
 ---
 

@@ -1,13 +1,14 @@
 {
   "name": "zcode2api",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "private": true,
   "description": "zcgw — ZCode 多账号反代网关（零依赖，单文件）",
   "type": "module",
   "scripts": {
-    "check": "node --check zcgw-server.mjs && node --check zcgw-fingerprint.mjs",
+    "check": "node --check zcgw-server.mjs && node --check zcgw-fingerprint.mjs && node --check zcgw-quota.mjs && node scripts/check-version.mjs",
     "start": "node zcgw-server.mjs",
-    "ci": "bash scripts/ci-backend.sh"
+    "ci": "bash scripts/ci-backend.sh",
+    "test": "node --test tests/*.test.mjs"
   },
   "engines": {
     "node": ">=22"

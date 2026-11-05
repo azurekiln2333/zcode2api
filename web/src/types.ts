@@ -26,6 +26,46 @@ export interface QuotaProtectionState {
   thresholdPercent: number
 }
 
+export interface QuotaItem {
+  id: string
+  name: string
+  unit: string
+  total: number | null
+  used: number | null
+  remaining: number | null
+  remainingPercent: number | null
+  resetAt: string | null
+}
+
+export interface QuotaPlan {
+  id: string
+  name: string
+  status: string
+  endsAt: string | null
+  items: QuotaItem[]
+}
+
+export interface QuotaSource {
+  id: string
+  name: string
+  status: 'pending' | 'ready' | 'error' | 'unconfigured'
+  plans: QuotaPlan[]
+  syncedAt: string | null
+  error: string | null
+}
+
+export interface Eligibility {
+  status: 'ready' | 'partial' | 'error'
+  plans: Array<{ planId: string; name: string; description: string }>
+  checkedAt: string
+  error: string | null
+}
+
+export interface AccountRefresh {
+  quotaSources: QuotaSource[]
+  eligibility: Eligibility
+}
+
 export interface Account {
   id: string
   name: string
@@ -42,6 +82,10 @@ export interface Account {
   enabled: boolean
   disabled: boolean
   hasAccessToken: boolean
+  hasCodingPlanKey: boolean
+  codingPlanProvider: 'zai' | 'bigmodel'
+  quotaSources: QuotaSource[]
+  eligibility: Eligibility | null
   quotaProtection?: QuotaProtectionState
   status: 'pending' | 'healthy' | 'unhealthy'
   checkedAt: string | null
@@ -52,7 +96,7 @@ export interface Account {
   latencyMs: number | null
   lastError: string
   quota: Quota | null
-  plans: Array<{ id: string; name: string; nameZh: string; kind: string; kindZh: string; status: string; endsAt: number | null }>
+  plans: QuotaPlan[]
   requests: number
   errors: number
   activeRequests: number

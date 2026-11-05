@@ -16,7 +16,10 @@ const form = reactive({
   name: a.value?.name ?? '',
   weight: a.value?.manualWeight ?? 1,
   realm: a.value?.realm === 'intl' ? 'intl' : a.value?.realm === 'cn' ? 'cn' : '',
+  codingPlanApiKey: '',
+  codingPlanProvider: a.value?.codingPlanProvider || (a.value?.realm === 'cn' ? 'bigmodel' : 'zai'),
 })
+const clearCodingKey = ref(false)
 const saving = ref(false)
 const error = ref('')
 
@@ -34,6 +37,8 @@ async function save() {
       name: form.name.trim() || undefined,
       weight: Number(form.weight),
       ...(form.realm ? { realm: form.realm } : {}),
+      codingPlanProvider: form.codingPlanProvider,
+      ...(clearCodingKey.value ? { codingPlanApiKey: '' } : form.codingPlanApiKey.trim() ? { codingPlanApiKey: form.codingPlanApiKey.trim() } : {}),
     }
     if (a.value) {
       await api(`/accounts/${encodeURIComponent(a.value.id)}`, 'PATCH', body)
@@ -98,6 +103,17 @@ async function save() {
             </button>
           </div>
         </label>
+        <label v-if="a">
+          Coding Plan 额度查询
+          <small>优先使用单独的 API Key；未配置时尝试已有登录凭证。</small>
+          <select v-model="form.codingPlanProvider" aria-label="Coding Plan 平台">
+            <option value="zai">Z.ai Coding Plan</option>
+            <option value="bigmodel">BigModel Coding Plan</option>
+          </select>
+          <input v-model="form.codingPlanApiKey" type="password" autocomplete="new-password"
+            :disabled="clearCodingKey" :placeholder="a.hasCodingPlanKey ? '已配置，留空保留原密钥' : '填写对应平台的 Coding Plan API Key'" />
+        </label>
+        <label v-if="a?.hasCodingPlanKey"><input v-model="clearCodingKey" type="checkbox" />清除已保存的 Coding Plan API Key</label>
         <div v-if="a" class="note-box">
           <Info :size="15" /><span
             >彻底停用账号请在「账号管理」表格的批量操作或更多菜单里切换，停用后不参与任何调度。</span
