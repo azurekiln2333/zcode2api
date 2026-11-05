@@ -248,6 +248,8 @@ API Key 保存在数据目录的 `accounts.json`，面板只返回是否已配�
 
 发布前同步根 `package.json`、`web/package.json` 和锁文件版本。`node scripts/check-version.mjs` 与 CI 会校验一致性及发布标签；Docker 构建也会校验前后端版本。升级后可用 `/health` 的 `version` 核对容器实际版本。
 
+推送 `v*` 标签会触发镜像发布。若标签已经存在但发布任务未触发，可在 GitHub Actions 的 **Build and release → Run workflow** 中选择 `main`，填写已有 `tag`（例如 `v1.1.3`）。流水线会检出该标签、校验版本并通过测试后发布对应镜像。
+
 ---
 
 ## 环境变量
