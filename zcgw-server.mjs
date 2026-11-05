@@ -1484,14 +1484,20 @@ async function handleQuota(req, res) {
   sendJson(res, 200, { accounts: out });
 }
 
-async function quotaJson(url, headers) {
+async function quotaJson(url, headers, { allowEmptyData = false, notFoundIsEmpty = false } = {}) {
   const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
   const j = await safeJson(r);
-  if (!r.ok || j.__error || j.success === false || ![0, 200, '0', '200'].includes(j.code)) {
+  // Only billing/preview uses 404 to mean that no activity is being offered.
+  if (notFoundIsEmpty && r.status === 404) return {};
+  if (!r.ok || !j || typeof j !== 'object' || Array.isArray(j) || j.__error || j.success === false || ![0, 200, '0', '200'].includes(j.code)) {
     // Never echo upstream payloads, which may contain credentials or personal data.
-    throw new Error(`查询失败（HTTP ${r.status}，业务码 ${Number(j.code) || '未知'}）`);
+    const code = j?.code ?? j?.provider_code;
+    const codeText = code != null && String(code).trim() && Number.isFinite(Number(code)) ? Number(code) : '未知';
+    throw new Error(`查询失败（HTTP ${r.status}，业务码 ${codeText}）`);
   }
-  if (!j.data || typeof j.data !== 'object') throw new Error('查询响应缺少 data');
+  // Eligibility endpoints may omit data on success. Balance endpoints still require it.
+  if (allowEmptyData && j.data == null) return {};
+  if (!j.data || typeof j.data !== 'object' || Array.isArray(j.data)) throw new Error('查询响应缺少有效 data');
   return j.data;
 }
 
@@ -1540,18 +1546,33 @@ async function refreshQuotaAccount(acc) {
   return Promise.all(['billing', 'coding'].map((id) => refreshQuotaSource(acc, id)));
 }
 
-/** 可领取的 plan 列表 + 候选 id（preview 为空时用来兑底） */
+function parseClaimPlan(p) {
+  if (!p || typeof p !== 'object') return null;
+  const id = p.plan_id ?? p.planId;
+  const planId = typeof id === 'string' ? id.trim() : '';
+  if (!planId) return null;
+  return {
+    planId,
+    name: (typeof p.name === 'string' && p.name.trim()) || planId,
+    description: typeof p.description === 'string' ? p.description.trim() : '',
+    priority: Number.isFinite(p.priority) ? p.priority : 0,
+    entitlements: (Array.isArray(p.entitlements) ? p.entitlements : []).filter((e) => e && typeof e === 'object')
+      .map((e) => ({ model: e.show_name, grant: e.grant_units, period: e.period })),
+  };
+}
+
+/** Match zcode-switch: successful empty data/plans and preview 404 mean no offers. */
 async function claimableFor(acc) {
+  const headers = upstreamHeaders(acc);
+  const query = new URLSearchParams({ app_version: APP_VERSION, platform: headers['x-platform'] });
   const data = await quotaJson(
-    `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=win32-x64`,
-    upstreamHeaders(acc),
+    `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/preview?${query}`,
+    headers,
+    { allowEmptyData: true, notFoundIsEmpty: true },
   );
-  if (!Array.isArray(data.plans)) throw new Error('资格响应缺少 plans');
-  const plans = data.plans.map((p) => ({
-    planId: String(p.plan_id || ''), name: String(p.name || p.plan_id || ''),
-    description: String(p.description || ''),
-    entitlements: (p.entitlements || []).map((e) => ({ model: e.show_name, grant: e.grant_units, period: e.period })),
-  })).filter((p) => p.planId);
+  const list = data.plans ?? [];
+  if (!Array.isArray(list)) throw new Error('资格响应的 plans 格式不正确');
+  const plans = list.map(parseClaimPlan).filter(Boolean);
   return { plans, rawCode: 0, rawMsg: '' };
 }
 
@@ -1560,48 +1581,60 @@ async function claimableFor(acc) {
 // deliveries 按钮带 claim_zcode_plan 的 plan_id。2026-11 的 GLOBAL BUILD 活动实测只出现在
 // marketing 通道 —— 只猜日期编码会永远领不到。
 
-/** 递归收集 delivery 里活动按钮的 plan_id（action.type = claim_zcode_plan） */
-function collectClaimButtons(v, out) {
+/** Deliveries carry both claim buttons and full plans inside background/hero payloads. */
+function collectMarketingPlans(v, plans, buttonIds) {
   if (Array.isArray(v)) {
-    for (const it of v) collectClaimButtons(it, out);
+    for (const it of v) collectMarketingPlans(it, plans, buttonIds);
   } else if (v && typeof v === 'object') {
     const action = v.action;
     if (action && typeof action === 'object') {
       const ty = action.type || '';
       if (ty === 'claim_zcode_plan' || ty === 'claim_plan') {
-        const id = String(action.args?.plan_id || action.planId || '').trim();
-        if (id) out.push(id);
+        const id = action.args?.plan_id ?? action.planId;
+        if (typeof id === 'string' && id.trim()) buttonIds.add(id.trim());
       }
     }
-    for (const val of Object.values(v)) collectClaimButtons(val, out);
+    if (typeof v.name === 'string' || Array.isArray(v.entitlements)) {
+      const plan = parseClaimPlan(v);
+      if (plan && !plans.has(plan.planId)) plans.set(plan.planId, plan);
+    }
+    for (const val of Object.values(v)) collectMarketingPlans(val, plans, buttonIds);
   }
 }
 
 /** Both channels are queried independently; failure is not an empty eligibility result. */
-async function marketingClaimableIds(acc) {
-  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/marketing/touch?seq=0`, upstreamHeaders(acc));
-  if (!Array.isArray(data.deliveries)) throw new Error('活动响应缺少 deliveries');
-  const ids = [];
-  for (const d of data.deliveries) collectClaimButtons(d, ids);
-  return [...new Set(ids)];
+async function marketingClaimablePlans(acc) {
+  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/marketing/touch?seq=0`, upstreamHeaders(acc), { allowEmptyData: true });
+  const deliveries = data.deliveries ?? [];
+  if (!Array.isArray(deliveries)) throw new Error('活动响应的 deliveries 格式不正确');
+  const plans = new Map();
+  const buttonIds = new Set();
+  for (const d of deliveries) collectMarketingPlans(d, plans, buttonIds);
+  for (const id of buttonIds) if (!plans.has(id)) plans.set(id, parseClaimPlan({ plan_id: id }));
+  return [...plans.values()];
 }
 
 async function refreshEligibility(acc) {
   const key = `${acc.label}:eligibility`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
   const run = (async () => {
-    const results = await Promise.allSettled([claimableFor(acc), marketingClaimableIds(acc)]);
+    const results = await Promise.allSettled([claimableFor(acc), marketingClaimablePlans(acc)]);
     const plans = new Map();
     const errors = [];
     if (results[0].status === 'fulfilled') {
       for (const p of results[0].value.plans) plans.set(p.planId, p);
     } else errors.push(`套餐资格：${results[0].reason.message}`);
     if (results[1].status === 'fulfilled') {
-      for (const id of results[1].value) if (!plans.has(id)) plans.set(id, { planId: id, name: id, description: '', entitlements: [] });
+      for (const p of results[1].value) {
+        const existing = plans.get(p.planId);
+        if (!existing) plans.set(p.planId, p);
+        else if (!existing.description) existing.description = p.description;
+      }
     } else errors.push(`活动资格：${results[1].reason.message}`);
     const state = {
       status: errors.length === 2 ? 'error' : errors.length ? 'partial' : 'ready',
-      plans: [...plans.values()], checkedAt: new Date().toISOString(), error: errors.join('；') || null,
+      plans: [...plans.values()].sort((a, b) => b.priority - a.priority || a.planId.localeCompare(b.planId)),
+      checkedAt: new Date().toISOString(), error: errors.join('；') || null,
     };
     eligibilityCache.set(acc.label, state);
     return state;
@@ -1613,7 +1646,7 @@ async function refreshEligibility(acc) {
 async function claimCandidates(acc, planId) {
   if (planId) return [planId];
   const state = await refreshEligibility(acc);
-  if (state.status === 'error') throw new Error(state.error);
+  if (state.status !== 'ready' && !state.plans.length) throw new Error(state.error);
   return state.plans.map((p) => p.planId);
 }
 
@@ -1728,14 +1761,13 @@ async function claimFor(acc, planId, captchaParam) {
     };
   }
   if (dup.length) {
-    // 缺失的类型回 1003 → 上游确实领过，但不在生效列表里 → 该一次性体验包已过期/用尽
+    // 1003 only means already claimed; it provides no evidence of expiry.
     return {
       ok: true,
       alreadyClaimed: true,
-      expired: true,
       claimed: dup[0].planId,
       upstreamMsg: dup[0].msg || '',
-      msg: '上游返回 1003（target already exists）：该号此前已领过体验包，当前不在生效列表，体验窗口已结束，无法重复领取',
+      msg: '该套餐已领取，无需重复领取；有效期请查看套餐额度',
       tried,
     };
   }

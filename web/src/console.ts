@@ -179,7 +179,7 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
       cancelCaptcha()
       const x = last ?? { ok: false, msg: '领取未返回结果' }
       if (x.expired) notify('注册礼包已领过（新号专属，4 天窗口）', true)
-      else if (x.ok && x.alreadyClaimed) notify('额度已在生效中，无需重复领取')
+      else if (x.ok && x.alreadyClaimed) notify('套餐已领取，无需重复领取')
       else if (x.ok) notify(`已成功领取 ${x.claimed ?? '额度'}`)
       else notify(x.msg || '当前不在可领取窗口', true)
       await refreshAccount(id)

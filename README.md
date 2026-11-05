@@ -244,6 +244,8 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 
 API Key 保存在数据目录的 `accounts.json`，面板只返回是否已配置。领取资格同时查询 preview 和 marketing；任一通道失败会单独提示，避免把失败误报为「无可领取套餐」。
 
+资格查询遵循 `zcode-switch` 的空结果语义：接口成功但没有 `data` / 套餐列表，或 preview 返回 HTTP 404，表示本次没有下发可领取套餐；鉴权失败、服务端错误、非成功业务码和无效响应仍会报错。活动通道同时解析领取按钮和内嵌套餐，按套餐 ID 去重、优先级排序。上游返回 1003 仅表示「已领取」，不据此判断套餐已过期。
+
 发布前同步根 `package.json`、`web/package.json` 和锁文件版本。`node scripts/check-version.mjs` 与 CI 会校验一致性及发布标签；Docker 构建也会校验前后端版本。升级后可用 `/health` 的 `version` 核对容器实际版本。
 
 ---

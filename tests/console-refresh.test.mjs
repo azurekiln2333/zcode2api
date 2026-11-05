@@ -23,19 +23,28 @@ test('authenticated console refresh preserves distinct sources and partial failu
   let failPreview = false;
   let emptyMarketing = false;
   let failMarketing = false;
+  let previewReply;
+  let marketingReply;
+  let balanceReply;
+  let claimCode = 0;
   let claims = 0;
   let claimBody;
   let balanceCalls = 0;
   const requests = [];
   const upstream = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
-    requests.push(url.pathname);
+    requests.push({ path: url.pathname, method: req.method, query: Object.fromEntries(url.searchParams), headers: req.headers });
+    const reply = ({ body, status = 200 }) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(typeof body === 'string' ? body : JSON.stringify(body));
+    };
     const send = (data, code = 0, status = 200) => {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ code, data }));
     };
     if (url.pathname.endsWith('/billing/balance')) {
       balanceCalls++;
+      if (balanceReply) return reply(balanceReply);
       if (failBalance) return send(null, 1006, 401);
       return send({
         plans: [
@@ -56,10 +65,12 @@ test('authenticated console refresh preserves distinct sources and partial failu
       ] }, 200);
     }
     if (url.pathname.endsWith('/billing/preview')) {
+      if (previewReply) return reply(previewReply);
       if (failPreview) return send(null, 1006, 401);
-      return send({ plans: [{ plan_id: 'gift', name: '注册礼包', entitlements: [] }] });
+      return send({ plans: [{ plan_id: 'gift', name: '注册礼包', priority: 10, entitlements: [] }] });
     }
     if (url.pathname.endsWith('/marketing/touch')) {
+      if (marketingReply) return reply(marketingReply);
       if (failMarketing) return send(null, 500, 500);
       return send({ deliveries: emptyMarketing ? [] : [
         { buttons: [{ action: { type: 'claim_zcode_plan', args: { plan_id: 'gift' } } },
@@ -72,7 +83,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
       claimBody = JSON.parse(Buffer.concat(chunks));
       claims++;
       assert.equal(req.headers['x-aliyun-captcha-verify-param'], 'test-captcha');
-      return send({ plan: { plan_id: claimBody.plan_id } });
+      return send({ plan: { plan_id: claimBody.plan_id } }, claimCode);
     }
     send(null, 404, 404);
   });
@@ -164,4 +175,123 @@ test('authenticated console refresh preserves distinct sources and partial failu
   assert.equal(overview.accounts[0].hasCodingPlanKey, false);
   assert.equal(overview.accounts[0].quotaSources[1].status, 'unconfigured');
   assert.equal(overview.accounts[0].enabled, false);
+
+  const refreshEligibility = async () => (await api('/api/accounts/disabled-account/refresh', 'POST', {})).body.eligibility;
+  await t.test('successful empty preview responses and preview 404 mean no eligible plans', async () => {
+    marketingReply = { body: { code: 0, data: { deliveries: [] } } };
+    for (const response of [
+      { body: { code: 0 } },
+      { body: { code: 0, data: null } },
+      { body: { code: '0', data: {} } },
+      { body: { code: 0, data: { plans: null } } },
+      { body: { code: 0, data: { plans: [] } } },
+      { body: '', status: 404 },
+    ]) {
+      previewReply = response;
+      const state = await refreshEligibility();
+      assert.equal(state.status, 'ready', JSON.stringify(response));
+      assert.deepEqual(state.plans, []);
+      assert.equal(state.error, null);
+    }
+    assert.equal(claims, 1, 'refresh must not submit a claim');
+  });
+
+  await t.test('successful empty marketing responses also mean no eligible plans', async () => {
+    previewReply = { body: { code: 0, data: null } };
+    for (const data of [undefined, null, {}, { deliveries: null }, { deliveries: [] }]) {
+      marketingReply = { body: { code: 0, data } };
+      const state = await refreshEligibility();
+      assert.equal(state.status, 'ready');
+      assert.deepEqual(state.plans, []);
+      assert.equal(state.error, null);
+    }
+  });
+
+  await t.test('empty eligibility compatibility does not hide upstream failures or invalid balances', async () => {
+    marketingReply = { body: { code: 0, data: { deliveries: [] } } };
+    for (const response of [
+      { body: { code: 1006 }, status: 401 },
+      { body: '<html>server error</html>', status: 500 },
+      { body: { code: 3012 } },
+      { body: { code: 0, success: false } },
+      { body: '<html>not JSON</html>' },
+      { body: null },
+      { body: {} },
+      { body: { code: 0, data: 'invalid' } },
+      { body: { code: 0, data: { plans: {} } } },
+    ]) {
+      previewReply = response;
+      const state = await refreshEligibility();
+      assert.equal(state.status, 'partial', JSON.stringify(response));
+      assert.match(state.error, /套餐资格/);
+      if (response.status) assert.ok(state.error.includes(`HTTP ${response.status}`));
+      if (response.body?.code === 3012) assert.match(state.error, /3012/);
+      assert.deepEqual(state.plans, []);
+    }
+    previewReply = { body: { code: 0, data: null } };
+    marketingReply = { body: '', status: 404 };
+    assert.match((await refreshEligibility()).error, /活动资格.*404/);
+    marketingReply = { body: { code: 0, data: { deliveries: [] } } };
+    balanceReply = { body: { code: 0, data: null } };
+    const current = (await api('/api/accounts/disabled-account/refresh', 'POST', {})).body;
+    assert.equal(current.eligibility.status, 'ready');
+    assert.equal(current.quotaSources[0].status, 'error', 'balance data must still be required');
+    assert.deepEqual(current.quotaSources[0].plans, previous.plans);
+    balanceReply = undefined;
+  });
+
+  await t.test('marketing discovers embedded plans, deduplicates buttons and preserves preview priority', async () => {
+    const payload = { plan_id: 'payload-plan', name: 'GLOBAL BUILD', description: '活动说明', priority: 50,
+      entitlements: [{ show_name: 'GLM-5.3', grant_units: 123, period: 'one_time' }] };
+    previewReply = { body: { code: 0, data: null } };
+    marketingReply = { body: { code: 0, data: { deliveries: [{ banner: {
+      background: { args: { zcode_plan: payload } },
+      success_popup: { hero: { args: { zcode_plan: payload } } },
+      side_panel: { hero: { args: { zcode_plan: { plan_id: 'embedded-only', name: 'Embedded offer', priority: 5 } } } },
+      buttons: [
+        { action: { type: 'claim_zcode_plan', args: { plan_id: 'payload-plan' } } },
+        { action: { type: 'claim_plan', planId: 'button-only' } },
+        { action: { type: 'navigate', args: { plan_id: 'ignore-me' } } },
+      ],
+    } }] } } };
+    let state = await refreshEligibility();
+    assert.equal(state.status, 'ready');
+    assert.deepEqual(state.plans.map((p) => p.planId), ['payload-plan', 'embedded-only', 'button-only']);
+    assert.equal(state.plans[0].name, 'GLOBAL BUILD');
+    assert.deepEqual(state.plans[0].entitlements, [{ model: 'GLM-5.3', grant: 123, period: 'one_time' }]);
+    previewReply = { body: { code: 0, data: { plans: [null, { planId: 'payload-plan', name: 'Preview name', priority: 10 }, { plan_id: '' }] } } };
+    state = await refreshEligibility();
+    assert.equal(state.plans[0].name, 'Preview name');
+    assert.equal(state.plans[0].description, '活动说明');
+    assert.equal(state.plans[0].priority, 10);
+    assert.equal(state.plans.length, 3);
+    previewReply = { body: { code: 1006 }, status: 401 };
+    const fallback = (await api('/api/accounts/disabled-account/claim', 'POST', { captchaParam: 'test-captcha' })).body;
+    assert.equal(fallback.results[0].ok, true, 'marketing plans remain claimable when preview fails');
+    assert.equal(claimBody.plan_id, 'payload-plan');
+    assert.equal(claims, 2);
+  });
+
+  await t.test('claim preserves lookup errors and does not equate already claimed with expired', async () => {
+    marketingReply = { body: { code: 0, data: { deliveries: [] } } };
+    const failure = (await api('/api/accounts/disabled-account/claim', 'POST', { captchaParam: 'test-captcha' })).body;
+    assert.equal(failure.results[0].ok, false);
+    assert.match(failure.results[0].msg, /套餐资格.*401/);
+    assert.equal(claims, 2);
+    previewReply = { body: { code: 0, data: null } };
+    claimCode = 1003;
+    const duplicate = (await api('/api/accounts/disabled-account/claim', 'POST', { planId: 'start', captchaParam: 'test-captcha' })).body;
+    assert.equal(duplicate.results[0].alreadyClaimed, true);
+    assert.equal(duplicate.results[0].expired, undefined);
+  });
+
+  await t.test('preview query and identity headers use the same client platform and version', () => {
+    const req = requests.find((r) => r.path.endsWith('/billing/preview'));
+    assert.equal(req.method, 'GET');
+    assert.equal(req.query.platform, req.headers['x-platform']);
+    assert.equal(req.query.app_version, req.headers['x-zcode-app-version']);
+    for (const key of ['authorization', 'x-device-mid', 'x-zcode-app-version', 'x-platform', 'x-os-category', 'x-client-language', 'x-client-timezone', 'x-title', 'user-agent']) {
+      assert.ok(req.headers[key], `missing ${key}`);
+    }
+  });
 });
