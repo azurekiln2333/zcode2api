@@ -25,6 +25,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
+      - name: Validate Compose configurations
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.build.yml config --quiet
       - name: Verify backend (syntax + boot + smoke)
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
@@ -80,10 +84,13 @@ jobs:
           notes=$(printf '%s\n' \
             "Docker image: \`docker pull ${{ steps.meta.outputs.image }}:$RELEASE_TAG\`" \
             '' \
-            'Deploy: update docker-compose.yaml image (or docker compose up -d --build from source).' \
+            'Deploy: sync docker-compose.yml and run docker compose up -d. Watchtower checks latest every 10 minutes.' \
+            'Existing deployments: retain custom ports, environment and data mounts when syncing Compose; pulling the app image alone does not install Watchtower.' \
+            'Source build: docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build.' \
             'data/ 目录保存全部账号与配置，升级镜像不影响数据。')
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" --notes "$notes"
           else
             gh release create "$RELEASE_TAG" --verify-tag --title "zcgw $RELEASE_TAG" --notes "$notes"
           fi
+          gh release upload "$RELEASE_TAG" docker-compose.yml docker-compose.build.yml --clobber

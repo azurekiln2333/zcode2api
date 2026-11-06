@@ -1,9 +1,10 @@
 # zcgw — ZCode 多账号反代网关
 #
-#   docker compose up -d          # 启动（首次自动建目录）
+#   docker compose up -d          # 启动网关和 Watchtower（首次自动建目录）
 #   docker compose logs -f        # 跟日志
 #   docker compose down           # 停止（数据保留）
-#   docker compose up -d --build  # 更新代码后重建
+#   docker compose logs -f watchtower  # 查看自动更新日志
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build  # 源码构建
 #
 # 数据全部落在 ./data/（宿主机可备份/编辑）：
 #   accounts.json  keys.json  usage.jsonl  pool-*.json  security.json  onboard-flows.json
@@ -12,16 +13,15 @@
 
 services:
   zcgw:
-    build: .                    # 源码构建；走 CI 镜像可注释 build 改用 image: ghcr.io/azurekiln2333/zcode2api:latest
-    image: zcgw:latest
+    image: "${ZCGW_IMAGE:-ghcr.io/azurekiln2333/zcode2api:latest}"
     container_name: zcgw
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8787:8787"   # 只本机 nginx 反代；如需直连 IP:8787 改回 "8787:8787"
+      - "127.0.0.1:${PORT:-8787}:${PORT:-8787}"   # 只本机 nginx 反代；已有部署可在 .env 中设置 PORT=12283
     environment:
       # 监听容器内 0.0.0.0（必须，docker 端口映射依赖它）
       HOST: 0.0.0.0
-      PORT: 8787
+      PORT: "${PORT:-8787}"
       # 可选：主密钥（面板密钥之外的后门 key）；一般留空用面板建的 key
       GATEWAY_KEY: ""
       # 可选：面板登录口令 —— 设置后面板需密钥登录（7 天会话），数据面 /v1/* 不受影响；
@@ -35,8 +35,11 @@ services:
       # ZCGW_MAX_INFLIGHT: "5"
     volumes:
       - ./data:/app/data
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: "${COMPOSE_PROJECT_NAME:-zcode2api}"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -44,6 +47,25 @@ services:
     # 轻量加固
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: nickfedor/watchtower:1.23.2
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_SCOPE: "${COMPOSE_PROJECT_NAME:-zcode2api}"
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_POLL_INTERVAL:-600}"
+      WATCHTOWER_CLEANUP: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.scope: "${COMPOSE_PROJECT_NAME:-zcode2api}"
     logging:
       driver: json-file
       options:

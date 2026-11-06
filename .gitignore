@@ -1,4 +1,7 @@
 # 敏感与运行时数据 —— 绝不入库
+.env
+.env.*
+!.env.example
 data/
 *.jsonl
 accounts*.json

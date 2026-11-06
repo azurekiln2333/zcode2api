@@ -115,18 +115,56 @@
 ### Docker Compose（推荐，服务器）
 
 ```bash
-git clone https://github.com/angusdevgo/zcode2api.git
+git clone https://github.com/azurekiln2333/zcode2api.git
 cd zcode2api
-docker compose up -d --build
+docker compose up -d
 ```
 
-数据落在宿主机 `./data/`，升级 = `git pull && docker compose up -d --build`。
+默认启动 `zcgw` 和 Watchtower，使用 `ghcr.io/azurekiln2333/zcode2api:latest`。
+数据保存在宿主机 `./data/`。
+
+Watchtower 配置与 `cnb2api-panel` 一致，使用 `nickfedor/watchtower:1.23.2`。
+它每 10 分钟检查一次镜像，有更新就拉取镜像并重建网关容器，随后清理旧镜像。
+它通过 Docker socket 管理容器，只更新同一 Compose 项目内带启用标签的容器，自身不参与自动更新。
+更新保留容器环境变量和数据挂载，重建期间请求会短暂中断。
+
+可在 Compose 同目录的 `.env` 中设置以下选项：
+
+```dotenv
+ZCGW_IMAGE=ghcr.io/azurekiln2333/zcode2api:latest
+WATCHTOWER_POLL_INTERVAL=600
+PORT=8787
+```
+
+检查间隔以秒为单位。已有部署使用 `12283` 时，把 `PORT` 设为 `12283`，端口映射、容器监听和健康检查会使用同一端口。
+固定版本标签（如 `ZCGW_IMAGE=ghcr.io/azurekiln2333/zcode2api:v1.1.8`）不会自动切换到下一个版本标签。
+
+已有部署需要先同步新版 `docker-compose.yml`，保留原有端口、环境变量和数据挂载，再执行一次：
+
+```bash
+docker compose up -d
+docker compose logs --tail=100 watchtower
+```
+
+仅拉取应用镜像不会更新服务器上的 Compose 文件，也不会新增 Watchtower 服务。
+启动 Watchtower 后，后续正式版发布到 `latest` 即可自动更新。
+修改 `.env` 或 Compose 后，仍需执行 `docker compose up -d` 应用配置。
+暂停自动更新使用 `docker compose stop watchtower`，恢复使用 `docker compose up -d watchtower`。
+
+需要从源码构建时，使用附带的覆盖配置：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+源码构建使用本地镜像 `zcgw:local`，默认不启动 Watchtower，网关也不参与自动更新。
+更新源码后重复执行这条构建命令。
 
 ### Docker 单容器
 
 ```bash
 # 端口只绑本机：公网访问请走反向代理（HTTPS + 访问控制），直接暴露管理面风险高
-docker run -d --name zcode2api -p 127.0.0.1:8787:8787 -v /opt/zcode2api/data:/app/data angusdevgo/zcode2api:latest
+docker run -d --name zcode2api -p 127.0.0.1:8787:8787 -v /opt/zcode2api/data:/app/data ghcr.io/azurekiln2333/zcode2api:latest
 ```
 
 ### 裸机（零依赖）
