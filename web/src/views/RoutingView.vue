@@ -50,7 +50,7 @@ function normalize(settings?: Settings | null) {
   for (const key of NUMERIC) out[key] = Number(settings?.[key] ?? DEFAULTS[key])
   out.sessionAffinity = (settings?.stickyTtlMin ?? 30) > 0
   out.strategy = 'weighted'
-  out.weekendGrab = (settings as Settings | undefined)?.weekendGrab ?? true
+  out.weekendGrab = (settings as Settings | undefined)?.weekendGrab ?? false
   out.limits = (settings as Settings | undefined)?.limits ?? {}
   return out
 }

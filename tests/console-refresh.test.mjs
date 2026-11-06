@@ -30,6 +30,9 @@ test('authenticated console refresh preserves distinct sources and partial failu
   let marketingReply;
   let balanceReply;
   let claimCode = 0;
+  const renewedJwt = jwt('unconfigured') + '-renewed';
+  let claimReply;
+  let currentReply;
   let claims = 0;
   let claimBody;
   let balanceCalls = 0;
@@ -46,11 +49,18 @@ test('authenticated console refresh preserves distinct sources and partial failu
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ code, data }));
     };
+    if (url.pathname === '/cn/changelog') return reply({ body: '<h2>Release v3.18.0</h2><h2>Release v3.17.2</h2>' });
+    if (url.pathname.endsWith('/client/configs')) return send({ configs: { captcha: { enabled: true, region: 'sgp', prefix: 'test-prefix', sceneId: 'test-scene' } } });
+    if (url.pathname.endsWith('/billing/current')) {
+      if (currentReply) return reply(currentReply);
+      return send({ plans: [{ plan_id: 'already-owned', user_plan_id: 'user-plan-1', name: '任意已领套餐', status: 'active',
+        starts_at: 1770000000, ends_at: 1800000000, entitlements: [{ effective_at: 0 }] }] });
+    }
     if (url.pathname.endsWith('/oauth/cli/init')) {
       return send({ flow_id: 'test-login', authorize_url: 'https://example.invalid/login?state=test-login', poll_interval_sec: 1 });
     }
     if (url.pathname.endsWith('/oauth/cli/poll/test-login')) {
-      return send({ status: 'ready', token: jwt('unconfigured'), user: { user_id: 'reauthed-profile', name: 'Test user' } });
+      return send({ status: 'ready', token: renewedJwt, user: { id: 'reauthed-profile', user_id: 'different-namespace', name: 'Test user' } });
     }
     if (url.pathname.endsWith('/customer/getCustomerInfo')) {
       assert.equal(req.headers.authorization, 'Bearer test-profile-token');
@@ -89,7 +99,8 @@ test('authenticated console refresh preserves distinct sources and partial failu
     }
     if (url.pathname.endsWith('/billing/preview')) {
       if (req.headers.authorization === `Bearer ${jwt('activation-account')}`) {
-        const activated = activationEvents.filter((e) => e.body.user_id === 'authorized-profile').length === 2;
+        const activated = activationEvents.filter((e) => e.body.user_id === 'authorized-profile').length === 2
+          && req.headers['x-zcode-app-version'] === '3.18.0';
         return send({ plans: activated ? [{ plan_id: 'activated-offer', name: 'Activated offer' }] : [] });
       }
       if (previewReply) return reply(previewReply);
@@ -110,6 +121,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
       claimBody = JSON.parse(Buffer.concat(chunks));
       claims++;
       assert.equal(req.headers['x-aliyun-captcha-verify-param'], 'test-captcha');
+      if (claimReply) return reply(claimReply);
       return send({ plan: { plan_id: claimBody.plan_id } }, claimCode);
     }
     send(null, 404, 404);
@@ -126,7 +138,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
     cwd: root, windowsHide: true,
     env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', PANEL_KEY: 'test-panel', GATEWAY_KEY: '',
       ZCGW_DATA_DIR: dataDir, ZCODE_HOME: path.join(dataDir, 'empty'), ZCODE_UPSTREAM_ORIGIN: upstreamUrl,
-      ZCODE_ZAI_ORIGIN: upstreamUrl, ZCODE_BIGMODEL_ORIGIN: upstreamUrl, ZCGW_WEEKEND_GRAB: '0' },
+      ZCODE_ZAI_ORIGIN: upstreamUrl, ZCODE_BIGMODEL_ORIGIN: upstreamUrl, ZCGW_WEEKEND_GRAB: '0', ZCODE_HTTP_TRANSPORT: 'fetch', ZCODE_APP_VERSION: '3.16.3' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -270,7 +282,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
 
   await t.test('marketing discovers embedded plans, deduplicates buttons and preserves preview priority', async () => {
     const payload = { plan_id: 'payload-plan', name: 'GLOBAL BUILD', description: '活动说明', priority: 50,
-      entitlements: [{ show_name: 'GLM-5.3', grant_units: 123, period: 'one_time' }] };
+      entitlements: [{ meter: 'model_usage', unit_type: 'token', show_name: 'GLM-5.3', grant_units: 123, period: 'one_time' }] };
     previewReply = { body: { code: 0, data: null } };
     marketingReply = { body: { code: 0, data: { deliveries: [{ banner: {
       background: { args: { zcode_plan: payload } },
@@ -307,16 +319,26 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.match(failure.results[0].msg, /套餐资格.*401/);
     assert.equal(claims, 2);
     previewReply = { body: { code: 0, data: null } };
+    previewReply = { body: { code: 0, data: { plans: [{ plan_id: 'start', name: '任意套餐' }] } } };
     claimCode = 1003;
     const duplicate = (await api('/api/accounts/disabled-account/claim', 'POST', { planId: 'start', captchaParam: 'test-captcha' })).body;
     assert.equal(duplicate.results[0].alreadyClaimed, true);
+    assert.equal(duplicate.results[0].ok, false);
+    claimCode = 0;
     assert.equal(duplicate.results[0].expired, undefined);
   });
 
   await t.test('preview query and identity headers use the same client platform and version', () => {
     const req = requests.find((r) => r.path.endsWith('/billing/preview'));
     assert.equal(req.method, 'GET');
+    assert.equal(req.query.platform, `${process.platform}-${process.arch}`);
     assert.equal(req.query.platform, req.headers['x-platform']);
+    assert.equal(req.query.app_version, '3.18.0');
+    assert.equal(req.headers['user-agent'], 'ZCode/3.18.0');
+    assert.equal(req.headers['x-release-channel'], 'production');
+    assert.equal(req.headers['x-os-version'], os.release());
+    assert.equal(req.headers['x-client-timezone'], Intl.DateTimeFormat().resolvedOptions().timeZone);
+    for (const key of ['x-api-key', 'anthropic-version', 'anthropic-beta']) assert.equal(req.headers[key], undefined);
     assert.equal(req.query.app_version, req.headers['x-zcode-app-version']);
     for (const key of ['authorization', 'x-device-mid', 'x-zcode-app-version', 'x-platform', 'x-os-category', 'x-client-language', 'x-client-timezone', 'x-title', 'user-agent']) {
       assert.ok(req.headers[key], `missing ${key}`);
@@ -339,6 +361,11 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.deepEqual(first.body, parallel.body);
     const state = first.body.eligibility;
     assert.equal(state.activation.status, 'ready');
+    assert.equal(state.version.reported, '3.18.0');
+    assert.equal(state.version.configured, '3.16.3');
+    assert.equal(state.version.latest, '3.18.0');
+    assert.equal(state.diagnostics.preview.parsedCount, 1);
+    assert.equal(state.currentPlans[0].effectiveAt, 0);
     assert.equal(state.activation.error, null);
     assert.ok(Date.parse(state.activation.retryAt) > Date.parse(state.activation.checkedAt));
     assert.ok(state.plans.some((p) => p.planId === 'activated-offer'));
@@ -408,6 +435,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.equal(activationEvents.length, before, 'login alone does not trigger activation');
     const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
     assert.equal(saved.find((a) => a.label === 'unconfigured').activationUserId, 'reauthed-profile');
+    assert.equal(saved.find((a) => a.label === 'unconfigured').jwt, renewedJwt, 're-login must replace the stored gateway JWT');
     const refreshed = (await api('/api/accounts/unconfigured/refresh', 'POST', {})).body;
     assert.equal(refreshed.eligibility.activation.status, 'ready');
     assert.deepEqual(activationEvents.slice(before).map((e) => e.body.user_id), ['reauthed-profile', 'reauthed-profile']);
@@ -423,4 +451,82 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.equal(redeemed.status, 200);
     assert.equal(redeemed.body.status, 'ready');
   });
+
+  await t.test('prepare validates the selected offer before captcha and consumes the preparation once', async () => {
+    previewReply = { body: { code: 0, data: { plans: [{ plan_id: 'renamed-2099', name: '名称可以随时改变' }] } } };
+    marketingReply = { body: { code: 0, data: { deliveries: [] } } };
+    const before = claims;
+    const requestStart = requests.length;
+    const invalid = await api('/api/accounts/disabled-account/claim/start', 'POST', { planId: 'nonexistent' });
+    assert.equal(invalid.status, 409);
+    const prepared = await api('/api/accounts/disabled-account/claim/start', 'POST', { planId: 'renamed-2099' });
+    assert.equal(prepared.status, 200);
+    assert.equal(prepared.body.plan.name, '名称可以随时改变');
+    assert.equal(claims, before, 'preparation never consumes captcha or submits');
+    assert.deepEqual(requests.slice(requestStart).map((r) => r.path.split('/').at(-1)), ['preview', 'touch', 'current', 'preview', 'touch', 'current']);
+    const cfg = (await api('/api/captcha/config')).body;
+    assert.equal(cfg.region, 'sgp');
+    const submission = { planId: prepared.body.plan.planId, preparationId: prepared.body.preparationId,
+      captchaParam: 'test-captcha', captchaRegion: cfg.region };
+    // Discovery can change while the captcha window is open; use the prepared plan snapshot.
+    previewReply = { body: { code: 0, data: null } };
+    claimReply = { body: { code: 0 } };
+    const submitted = (await api('/api/accounts/disabled-account/claim', 'POST', submission)).body.results[0];
+    assert.equal(submitted.ok, true, 'success does not require data.plan');
+    assert.equal(submitted.claimed, 'renamed-2099');
+    assert.equal(claims, before + 1);
+    const request = requests.findLast((r) => r.path.endsWith('/billing/claim'));
+    assert.equal(request.headers['x-zcode-app-version'], '3.18.0');
+    assert.equal(request.headers['x-aliyun-captcha-verify-region'], 'sgp');
+    const replay = (await api('/api/accounts/disabled-account/claim', 'POST', submission)).body.results[0];
+    assert.equal(replay.code, 'preparation_expired');
+    assert.equal(claims, before + 1);
+    assert.equal((await api('/claim', 'POST', { captchaParam: 'test-captcha' })).status, 400);
+    claimReply = undefined;
+  });
+
+  await t.test('claim errors stop after one selected plan and do not retry captcha or other offers', async () => {
+    previewReply = { body: { code: 0, data: { plans: [
+      { plan_id: 'first', name: '套餐甲', priority: 10 }, { plan_id: 'second', name: '套餐乙' },
+    ] } } };
+    marketingReply = { body: { code: 0, data: { deliveries: [] } } };
+    for (const code of [1001, 1002, 1003, 1004, 1005, 3001, 3007]) {
+      claimReply = { body: { code, data: { plan: { ends_at: 1800000000 } } } };
+      const before = claims;
+      const result = (await api('/api/accounts/disabled-account/claim', 'POST', { captchaParam: 'test-captcha' })).body.results[0];
+      assert.equal(result.ok, false);
+      assert.equal(result.code, code);
+      assert.equal(claimBody.plan_id, 'first');
+      assert.equal(claims, before + 1, `code ${code} must be terminal`);
+      if (code === 1005) assert.equal(result.nextAt, 1800000000000);
+    }
+    claimReply = { status: 500, body: { code: 0 } };
+    assert.equal((await api('/api/accounts/disabled-account/claim', 'POST', { captchaParam: 'test-captcha' })).body.results[0].ok, false);
+    claimReply = { status: 403, body: 'captcha challenge secret-upstream-detail' };
+    const challenge = (await api('/api/accounts/disabled-account/claim', 'POST', { captchaParam: 'test-captcha' })).body.results[0];
+    assert.equal(challenge.code, -2);
+    assert.ok(!JSON.stringify(challenge).includes('secret-upstream-detail'));
+    claimReply = { body: { code: 0, data: { server_time: 1794000000, plan: {
+      starts_at: 1780000000, ends_at: 1800000000, entitlements: [{ effective_at: 0 }, { effective_at: 1800000000 }],
+    } } } };
+    const success = (await api('/api/accounts/disabled-account/claim', 'POST', { captchaParam: 'test-captcha' })).body.results[0];
+    assert.equal(success.effectiveAt, 0);
+    assert.equal(success.startsAt, 1780000000000);
+    assert.equal(success.serverTime, 1794000000000);
+    claimReply = undefined;
+  });
+
+  await t.test('current query failure preserves eligible offers and channel diagnostics', async () => {
+    currentReply = { status: 503, body: { code: 9000 } };
+    const state = await refreshEligibility();
+    assert.equal(state.status, 'ready');
+    assert.equal(state.plans.length, 2);
+    assert.match(state.currentError, /503.*9000/);
+    assert.equal(state.diagnostics.current.status, 503);
+    assert.equal(state.diagnostics.current.code, 9000);
+    assert.equal(state.diagnostics.preview.count, 2);
+    assert.equal(state.diagnostics.preview.transport, 'fetch');
+    currentReply = undefined;
+  });
+
 });

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, onUnmounted } from 'vue'
 import {
   Plus,
   RefreshCw,
@@ -43,7 +43,8 @@ import ModalShell from '../components/ModalShell.vue'
 import QuotaDetails from '../components/QuotaDetails.vue'
 
 const emit = defineEmits<{ navigate: [page: Page] }>()
-const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts } = useConsole()
+const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts, captchaState, captchaMessage, cancelClaim } = useConsole()
+onUnmounted(cancelClaim)
 const search = ref('')
 const tab = ref('all')
 const group = ref('all')
@@ -247,6 +248,10 @@ async function batch(enabled: boolean) {
     </div>
   </div>
   <section class="pool-panel">
+    <div v-if="captchaState === 'verifying' || captchaState === 'interactive'" class="table-toolbar" role="status">
+      <span>{{ captchaMessage }}</span>
+      <button class="quiet-button" @click="cancelClaim">取消验证</button>
+    </div>
     <div class="pool-panel-header">
       <div class="pool-tabs" role="tablist" aria-label="按账号状态筛选">
         <button
@@ -407,12 +412,32 @@ async function batch(enabled: boolean) {
                   <span v-if="account.eligibility.activation?.error" class="quota-sync-state error">{{ account.eligibility.activation.error }}</span>
                   <span v-else-if="account.eligibility.activation?.status === 'ready'" class="quota-updated">资格激活上报已完成</span>
                   <span v-if="account.eligibility.error" class="quota-sync-state error">{{ account.eligibility.error }}</span>
-                  <span v-if="account.eligibility.status === 'ready' && !account.eligibility.plans.length" class="quota-sync-state">暂无可领取套餐</span>
+                  <span v-if="account.eligibility.status === 'ready' && !account.eligibility.plans.length" class="quota-sync-state">上游本次未返回可领取套餐</span>
                   <button v-for="plan in account.eligibility.plans" :key="plan.planId"
-                    class="text-link small-link" :title="plan.description || plan.planId"
+                    class="text-link small-link" :title="plan.description || plan.campaign?.body || plan.planId"
                     :disabled="busy.has(account.id)" @click="rowAction(account.id, 'quota', plan.planId)">
                     <Zap :size="12" />领取 {{ plan.name }}
                   </button>
+                  <span v-if="account.eligibility.currentError" class="quota-sync-state error">已领套餐：{{ account.eligibility.currentError }}</span>
+                  <details v-if="account.eligibility.currentPlans?.length" class="quota-updated">
+                    <summary>已领套餐（{{ account.eligibility.currentPlans.length }}）</summary>
+                    <div v-for="plan in account.eligibility.currentPlans" :key="plan.userPlanId || plan.planId">
+                      {{ plan.name }} · {{ plan.status }}
+                      <span v-if="plan.effectiveAt === 0"> · 立即生效</span>
+                      <span v-else-if="plan.effectiveAt"> · {{ time(new Date(plan.effectiveAt).toISOString(), true) }} 生效</span>
+                      <span v-if="plan.endsAt"> · {{ time(new Date(plan.endsAt).toISOString(), true) }} 到期</span>
+                    </div>
+                  </details>
+                  <details v-if="account.eligibility.diagnostics" class="quota-updated">
+                    <summary>查询详情 · 客户端 {{ account.eligibility.version?.reported }}</summary>
+                    <div v-if="account.eligibility.version?.error">{{ account.eligibility.version.error }}</div>
+                    <div v-for="channel in (['preview', 'marketing', 'current'] as const)" :key="channel">
+                      {{ channel }}：HTTP {{ account.eligibility.diagnostics[channel].status ?? '—' }}，
+                      业务码 {{ account.eligibility.diagnostics[channel].code ?? '—' }}，
+                      返回 {{ account.eligibility.diagnostics[channel].count }} 项 / 解析 {{ account.eligibility.diagnostics[channel].parsedCount }} 个套餐，
+                      {{ account.eligibility.diagnostics[channel].transport || '未完成' }}
+                    </div>
+                  </details>
                   <span class="quota-updated">资格查询于 {{ time(account.eligibility.checkedAt, true) }}</span>
                 </template>
               </div>

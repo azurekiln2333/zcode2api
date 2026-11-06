@@ -54,9 +54,43 @@ export interface QuotaSource {
   error: string | null
 }
 
+export interface ClaimPlan {
+  planId: string
+  name: string
+  description: string
+  effectiveAt: number | null
+  entitlements: Array<{ model: string; grant: number; period: string }>
+  campaign: { title: string; body: string; startsAt: number | null; endsAt: number | null } | null
+}
+
+export interface ClaimResult {
+  ok: boolean
+  code?: number | string
+  msg?: string
+  alreadyClaimed?: boolean
+  planName?: string
+  effectiveAt?: number | null
+  startsAt?: number | null
+  endsAt?: number | null
+  nextAt?: number | null
+}
+
+interface EligibilityChannel {
+  status: number | null
+  code: number | null
+  count: number
+  parsedCount: number
+  transport: string | null
+  error: string | null
+}
+
 export interface Eligibility {
   status: 'ready' | 'partial' | 'error'
-  plans: Array<{ planId: string; name: string; description: string }>
+  plans: ClaimPlan[]
+  currentPlans?: Array<ClaimPlan & { userPlanId: string; status: string; startsAt: number | null; endsAt: number | null }>
+  currentError?: string | null
+  version?: { reported: string; latest: string | null; stale: boolean; checkedAt: string | null; error: string | null }
+  diagnostics?: { preview: EligibilityChannel; marketing: EligibilityChannel; current: EligibilityChannel; elapsedMs: number }
   checkedAt: string
   error: string | null
   activation?: {

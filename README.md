@@ -4,7 +4,7 @@
 
 **智谱 ZCode 账号池管理控制台 · Anthropic / OpenAI 双协议反代网关**
 
-把 ZCode 客户端专属额度（GLM-5.3 / GLM-5.3-Flash）反向代理成标准 API：多账号加权调度轮换、Web 面板纳管、多密钥分发、IP 管控、用量审计 —— **单文件 Node 服务，零 npm 依赖，Docker 一键部署**。
+把 ZCode 客户端专属额度（GLM-5.3 / GLM-5.3-Flash）反向代理成标准 API：多账号加权调度轮换、Web 面板纳管、多密钥分发、IP 管控、用量审计 —— **Node 服务，零 npm 依赖，Docker 一键部署**。
 
 ![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=nodedotjs&logoColor=white)
 ![零依赖](https://img.shields.io/badge/npm%20依赖-0-22c55e)
@@ -42,7 +42,7 @@
 | 限流了只能干等 | 自动冷却换号、指数退避熔断、粘性会话保缓存 |
 | 想分给朋友/多设备没门道 | 多密钥分发：各自独立有效期 / 配额 / 模型 / IP 白名单 |
 | 不知道谁用了多少 | 每次调用的模型、Token、延迟、来源 IP 全量留痕 |
-| 部署要装一堆依赖 | **单文件 Node 服务，零 npm 依赖**；Docker 镜像 ~60MB |
+| 部署要装一堆依赖 | **Node 服务，零 npm 依赖**；Docker 镜像内置 curl |
 
 **重要说明（3012 风控原理）**：上游对请求体中的 `system` 提示词做**内容指纹校验**——只接受 ZCode 客户端官方那份 10703 字符的原文。本网关的解法是：`system` 字段原样透传官方三段，应用的 system 指令降级为一个块插入首条 user 消息。这是整个项目能跑通的关键，也是唯一的"逆向"点，详见 `zcode-profile.json`。
 
@@ -52,7 +52,7 @@
 
 ### 账号管理
 
-- **登录即纳管** —— 设备授权流 / 粘贴 Token 两种方式；登录成功自动识别身份（手机号 / 邮箱 / 国内国际归属）、自动领取可用额度
+- **登录即纳管** —— 设备授权流 / 粘贴 Token 两种方式；登录成功自动识别身份（手机号 / 邮箱 / 国内国际归属）；刷新资格后可验证并领取额度
 - **额度总览** —— 按套餐类型与模型实时聚合（周期活动额度 / 新号注册礼包 / 付费套餐），进度条 + 临期预警
 - **手动权重** —— 每个账号 0~20 的调度权重：高的多吃额度，0 = 暂停（冻结额度）；实际权重 = 自动分 × 手动权重
 - **身份自动识别** —— 用 OAuth access_token 反查官方客户档案，免手填
@@ -132,12 +132,12 @@ docker run -d --name zcode2api -p 127.0.0.1:8787:8787 -v /opt/zcode2api/data:/ap
 ### 裸机（零依赖）
 
 ```bash
-node zcgw-server.mjs        # 只要 Node.js >= 22，无任何 npm install
+node zcgw-server.mjs        # Node.js >= 22，无需 npm install；安装 curl 可使用与 zcode-switch 一致的传输通道
 ```
 
 启动后浏览器打开 `http://<IP>:8787/`：
 
-1. **账号页** → 登录 ZCode 账号（设备授权流，或粘贴客户端 Token）→ 自动识别身份并领取额度
+1. **账号页** → 登录 ZCode 账号（设备授权流，或粘贴客户端 Token）→ 自动识别身份 → 刷新资格 → 选择套餐并完成人机验证
 2. **密钥页** → 新建一把 key（完整 key 只显示一次，立即复制）
 3. 把你的应用指向网关（见下）
 
@@ -225,6 +225,8 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 | `GET` | `/api/overview` | 面板 | 账号、按来源和套餐区分的额度快照、最近领取资格 |
 | `POST` | `/api/accounts/{id}/refresh` | 面板 | 激活后查询 preview / marketing 双通道领取资格，并刷新余额，停用账号也可使用 |
 | `GET` | `/pool` `/quota` `/keys` `/stats` `/logs` `/security` `/pool/settings` | 面板 | 管理面板后端 |
+| `POST` | `/api/accounts/{id}/claim/start` | 面板 | 重新查询并确认具体套餐，返回一次性领取准备 ID |
+| `POST` | `/api/accounts/{id}/claim` | 面板 | 提交选中套餐及验证码参数、地区；一次验证只提交一次 |
 | `POST` | `/claim` `/pool/reset` `/selftest` | 面板 | 领取额度 / 解除冷却 / 连通自检 |
 | `POST` | `/accounts/add` `/accounts/update` `/accounts/identify` | 面板 | 账号纳管 / 修改 / 身份识别 |
 | `POST` | `/api/onboard/start` `/api/onboard/redeem` | 面板 | 发起授权 / 提交授权回调链接；旧 `/onboard/*` 路径仍兼容 |
@@ -248,6 +250,13 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 API Key 保存在数据目录的 `accounts.json`，面板只返回是否已配置。领取资格同时查询 preview 和 marketing；任一通道失败会单独提示，避免把失败误报为「无可领取套餐」。
 
 资格查询遵循 `zcode-switch` 的空结果语义：接口成功但没有 `data` / 套餐列表，或 preview 返回 HTTP 404，表示本次没有下发可领取套餐；鉴权失败、服务端错误、非成功业务码和无效响应仍会报错。活动通道同时解析领取按钮和内嵌套餐，按套餐 ID 去重、优先级排序。上游返回 1003 仅表示「已领取」，不据此判断套餐已过期。
+
+v1.1.6 按本地 `zcode-switch` 源码移植资格查询与领取协议（来源和 MIT 许可见 `THIRD_PARTY_NOTICES.md`）：
+
+- 手动刷新先检查官方 changelog，使用本地已知版本、显式配置和缓存中的最高版本；内置版本为 `3.17.2`。官方版本缓存保存在数据目录的 `zcode-version-cache.json`，有效期 6 小时；查询失败继续使用已知版本。旧 `ZCODE_APP_VERSION` 配置不会把客户端版本降回去。
+- 激活、preview、marketing、current 使用一致的版本与稳定账号设备 ID。账单请求使用独立的 ZCode 请求头、实际运行平台和时区；优先走系统 curl。查询出现传输故障时回退 Node HTTP；HTTP/业务错误不换通道重试。验证码领取遇到结果不明的传输故障也不重放，先刷新已领套餐确认。
+- 活动按上游 ID 和载荷解析，不依赖套餐名称。保留活动文案、权益、生效时间和当前已领套餐。账号行「查询详情」显示本次客户端版本、各通道 HTTP/业务码、返回条数和实际传输方式；详情不包含凭据。
+- 先刷新并确认所选套餐，再打开验证码；提交携带 `captchaRegion`，只领取一个账号的一个套餐。3007、1001–1005 等失败直接结束，不自动换验证码或轮试其他套餐。领取成功后更新余额、已领套餐与资格，不重复上报激活事件。
 
 发布前同步根 `package.json`、`web/package.json` 和锁文件版本。`node scripts/check-version.mjs` 与 CI 会校验一致性及发布标签；Docker 构建也会校验前后端版本。升级后可用 `/health` 的 `version` 核对容器实际版本。
 

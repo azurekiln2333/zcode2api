@@ -1,7 +1,7 @@
 import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
 import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
-import type { Account, AccountRefresh, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
+import type { Account, AccountRefresh, ClaimPlan, ClaimResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
 
 const overview = ref<Overview | null>(null)
 const logs = ref<LogEntry[]>([])
@@ -22,12 +22,15 @@ const refreshProgress = ref<{ done: number; total: number } | null>(null)
 const toasts = ref<{ id: number; text: string; error: boolean; diagnostics?: ApiDiagnostics }[]>([])
 const registration = ref<{ account: Account; token: string } | null>(null)
 let notificationId = 0
+let activeClaimAccount: string | null = null
+let claimGeneration = 0
 let refreshPromise: Promise<void> | null = null
 const logsRequests: Partial<Record<LogChannel, { path: string; promise: Promise<void> }>> = {}
 let sessionGeneration = 0
 
 function reset() {
   sessionGeneration++
+  cancelClaim()
   overview.value = null
   logs.value = []
   registration.value = null
@@ -41,6 +44,11 @@ function reset() {
   delete logsRequests.requests
   logQueries.requests.value = emptyLogQuery()
   logPages.requests.value = { total: 0, loading: false }
+}
+
+function cancelClaim() {
+  claimGeneration++
+  cancelCaptcha()
 }
 
 export function notify(text: string, error = false, diagnostics?: ApiDiagnostics) {
@@ -134,11 +142,17 @@ async function refreshLogs(channel: LogChannel = 'requests', query = logQueries[
 
 /**
  * 账号行内操作：probe → 网关自检（真实走一次上游推理），quota → 领取套餐额度。
- * 领取前先跑阿里云人机验证（上游 claim 强制），3007 时自动换新验证参数重试一轮。
+ * 领取前重新确认选中套餐，再做一次验证码并提交；失败由用户重新发起。
  */
 async function action(id: string, operation: 'probe' | 'quota', planId?: string) {
   if (busy.value.has(id)) return
+  if (operation === 'quota' && activeClaimAccount !== null) {
+    notify('请先完成或取消当前人机验证', true)
+    return
+  }
   busy.value.add(id)
+  if (operation === 'quota') activeClaimAccount = id
+  const generation = claimGeneration
   try {
     if (operation === 'probe') {
       const result = await api<{ ok: boolean; account?: string; text?: string; ms?: number; error?: string }>(
@@ -153,40 +167,29 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
         !result.ok,
       )
     } else {
-      let last: { ok: boolean; alreadyClaimed?: boolean; expired?: boolean; claimed?: string; msg?: string; code?: number | string } | undefined
-      // 验证参数是一次性的：最多两轮（首轮 + 3007 换新参数重试）
-      for (let attempt = 0; attempt < 2; attempt++) {
-        captchaState.value = 'verifying'
-        let param: string
-        try {
-          param = await runCaptcha()
-        } catch (e) {
-          last = { ok: false, msg: e instanceof Error ? e.message : '人机验证失败' }
-          break
-        }
-        const result = await api<{ results?: Array<{ ok: boolean; alreadyClaimed?: boolean; expired?: boolean; claimed?: string; msg?: string; code?: number | string }> }>(
-          `/accounts/${encodeURIComponent(id)}/claim`,
-          'POST',
-          { captchaParam: param, planId },
-        )
-        last = (result.results ?? [])[0]
-        if (last?.code === 3007) {
-          captchaMessage.value = '验证参数已过期，正在重新验证…'
-          continue
-        }
-        break
-      }
+      captchaState.value = 'verifying'
+      captchaMessage.value = '正在确认可领取套餐…'
+      const prepared = await api<{ preparationId: string; plan: ClaimPlan }>(
+        `/accounts/${encodeURIComponent(id)}/claim/start`, 'POST', { planId },
+      )
+      if (generation !== claimGeneration) return
+      const proof = await runCaptcha()
+      if (generation !== claimGeneration) return
+      const result = await api<{ results: ClaimResult[] }>(
+        `/accounts/${encodeURIComponent(id)}/claim`, 'POST', {
+          planId: prepared.plan.planId, preparationId: prepared.preparationId,
+          captchaParam: proof.param, captchaRegion: proof.region,
+        },
+      )
       cancelCaptcha()
-      const x = last ?? { ok: false, msg: '领取未返回结果' }
-      if (x.expired) notify('注册礼包已领过（新号专属，4 天窗口）', true)
-      else if (x.ok && x.alreadyClaimed) notify('套餐已领取，无需重复领取')
-      else if (x.ok) notify(`已成功领取 ${x.claimed ?? '额度'}`)
-      else notify(x.msg || '当前不在可领取窗口', true)
-      await refreshAccount(id)
+      const outcome = result.results[0]
+      if (outcome?.ok) notify(`已成功领取 ${outcome.planName || prepared.plan.name}`)
+      else notify(outcome?.msg || '领取未返回结果', true)
     }
     await refresh()
   } catch (error) {
-    cancelCaptcha()
+    if (operation === 'quota') cancelCaptcha()
+    if (operation === 'quota' && generation !== claimGeneration) return
     notify(
       error instanceof Error ? error.message : '操作失败',
       true,
@@ -194,6 +197,7 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
     )
   } finally {
     busy.value.delete(id)
+    if (operation === 'quota') activeClaimAccount = null
   }
 }
 
@@ -216,7 +220,7 @@ async function refreshQualifications(ids?: string[]) {
       refreshingAccounts.value.add(id)
       try {
         const result = await refreshAccount(id)
-        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.quotaSources.some((s) => s.status === 'error')) failures++
+        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.eligibility.currentError || result.quotaSources.some((s) => s.status === 'error')) failures++
       } catch (error) {
         failures++
         if (generation === sessionGeneration) notify(`${id}：${error instanceof Error ? error.message : '刷新失败'}`, true)
@@ -376,6 +380,7 @@ export function useConsole() {
     accounts: computed(() => overview.value?.accounts ?? []),
     captchaState,
     captchaMessage,
+    cancelClaim,
     refresh,
     refreshLogs,
     reset,

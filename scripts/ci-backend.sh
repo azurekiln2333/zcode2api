@@ -9,6 +9,9 @@ echo "==> 语法检查"
 node --check zcgw-server.mjs
 node --check zcgw-fingerprint.mjs
 node --check zcgw-quota.mjs
+node --check zcgw-claim.mjs
+node --check zcgw-upstream.mjs
+node --check zcgw-version.mjs
 node scripts/check-version.mjs
 node --test tests/*.test.mjs
 

@@ -21,9 +21,13 @@ interface CaptchaConfig {
   sceneId: string
 }
 
+export interface CaptchaProof { param: string; region: string }
+
 let configCache: CaptchaConfig | null = null
+let configFetchedAt = 0
+let verificationId = 0
 let instance: { destroy?: () => void } | null = null
-let pendingResolve: ((param: string) => void) | null = null
+let pendingResolve: ((proof: CaptchaProof) => void) | null = null
 let pendingReject: ((err: Error) => void) | null = null
 let tracelessTimer = 0
 
@@ -39,8 +43,9 @@ function loadSdk(): Promise<void> {
 }
 
 async function ensureConfig(): Promise<CaptchaConfig> {
-  if (configCache) return configCache
+  if (configCache && Date.now() - configFetchedAt < 600_000) return configCache
   configCache = await api<CaptchaConfig>('/captcha/config')
+  configFetchedAt = Date.now()
   return configCache
 }
 
@@ -50,10 +55,14 @@ function cleanup() {
     instance?.destroy?.()
   } catch {}
   instance = null
+  const holder = document.getElementById('zcgw-captcha-holder')
+  if (holder) holder.style.display = 'none'
 }
 
-function initCaptcha(cfg: CaptchaConfig, onFail: (why: unknown) => void) {
+function initCaptcha(cfg: CaptchaConfig, current: () => boolean, onFail: (why: unknown) => void) {
   cleanup()
+  const holder = document.getElementById('zcgw-captcha-holder')
+  if (holder) holder.style.display = ''
   ;(window as any).AliyunCaptchaConfig = { region: cfg.region, prefix: cfg.prefix }
   ;(window as any).initAliyunCaptcha({
     SceneId: cfg.sceneId,
@@ -63,11 +72,14 @@ function initCaptcha(cfg: CaptchaConfig, onFail: (why: unknown) => void) {
     element: '#zcgw-captcha-holder',
     button: '#zcgw-captcha-btn',
     getInstance: (i: any) => {
+      if (!current()) { i.destroy?.(); return }
       instance = i
       if (typeof i.startTracelessVerification === 'function') {
         i.startTracelessVerification()
         // 无痕验证 8 秒不回调 → 需要人工点一下（zcode-switch 同款兜底）
+        if (!current()) return
         tracelessTimer = window.setTimeout(() => {
+          if (!current()) return
           captchaState.value = 'interactive'
           captchaMessage.value = '需要人工验证：请点击下方按钮完成拼图'
           onFail('traceless-timeout')
@@ -79,23 +91,27 @@ function initCaptcha(cfg: CaptchaConfig, onFail: (why: unknown) => void) {
       }
     },
     success: (param: string | { captchaVerifyParam: string }) => {
+      if (!current()) return
       clearTimeout(tracelessTimer)
       const p = typeof param === 'string' ? param : param?.captchaVerifyParam
+      if (!p?.trim()) { onFail('empty-param'); return }
       captchaState.value = 'ready'
       captchaMessage.value = ''
-      if (p?.trim() && pendingResolve) {
+      if (pendingResolve) {
         const resolve = pendingResolve
         pendingResolve = null
         pendingReject = null
         cleanup()
-        resolve(p.trim())
+        resolve({ param: p.trim(), region: cfg.region })
       }
     },
     fail: (p: unknown) => {
+      if (!current()) return
       clearTimeout(tracelessTimer)
       onFail(p)
     },
     onError: (p: unknown) => {
+      if (!current()) return
       clearTimeout(tracelessTimer)
       onFail(p)
     },
@@ -106,35 +122,35 @@ function initCaptcha(cfg: CaptchaConfig, onFail: (why: unknown) => void) {
  * 跑一次人机验证，resolve 出 captchaVerifyParam。
  * 无痕验证失败/超时会转交互模式，由用户点按钮完成。
  */
-export async function runCaptcha(): Promise<string> {
-  if (pendingResolve) {
-    throw new Error('上一次验证还没完成，请先完成或稍候重试')
-  }
+export function runCaptcha(): Promise<CaptchaProof> {
+  if (pendingResolve) return Promise.reject(new Error('上一次验证还没完成，请先完成或取消'))
+  const id = ++verificationId
+  const current = () => id === verificationId && pendingResolve !== null
   captchaState.value = 'verifying'
   captchaMessage.value = '正在准备人机验证…'
-  const cfg = await ensureConfig()
-  if (!cfg.enabled || !cfg.sceneId) {
-    captchaState.value = 'idle'
-    throw new Error('上游未开启验证码配置，无法领取（可稍后重试）')
-  }
-  await loadSdk()
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<CaptchaProof>((resolve, reject) => {
     pendingResolve = resolve
     pendingReject = reject
-    const start = () =>
-      initCaptcha(cfg, (why) => {
-        // 首次无痕失败自动重建一次（zcode-switch：3007/参数无效时换新参数重试一轮）
-        if (captchaState.value === 'verifying') {
-          captchaState.value = 'interactive'
-        }
-        if (why && captchaMessage.value === '') {
-          captchaMessage.value =
-            '需要人工验证：请点击下方按钮完成拼图'
-        }
+    void (async () => {
+      const cfg = await ensureConfig()
+      if (!current()) return
+      if (!cfg.enabled || !cfg.sceneId) throw new Error('上游未开启验证码配置，无法领取（可稍后重试）')
+      await loadSdk()
+      if (!current()) return
+      ensureHolder()
+      initCaptcha(cfg, current, () => {
+        if (!current()) return
+        captchaState.value = 'interactive'
+        captchaMessage.value = '需要人工验证：请点击下方按钮完成拼图'
       })
-    // 容器节点必须已挂载 —— 用隐藏容器常驻 body
-    ensureHolder()
-    start()
+    })().catch((error) => {
+      if (!current()) return
+      pendingResolve = null
+      pendingReject = null
+      captchaState.value = 'idle'
+      cleanup()
+      reject(error)
+    })
   })
 }
 
@@ -152,12 +168,16 @@ function ensureHolder() {
   document.body.appendChild(holder)
 }
 
-/** 测试钩子：pending 状态复位（组件卸载时用） */
+/** 取消会结束等待中的调用，释放账号操作状态。 */
 export function cancelCaptcha() {
+  verificationId++
+  const reject = pendingReject
   pendingResolve = null
   pendingReject = null
   captchaState.value = 'idle'
+  captchaMessage.value = ''
   cleanup()
+  reject?.(new Error('已取消人机验证'))
 }
 
 declare global {

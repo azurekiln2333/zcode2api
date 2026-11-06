@@ -17,6 +17,9 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { normalizeBilling, normalizeCoding } from './zcgw-quota.mjs';
+import { createVersionManager } from './zcgw-version.mjs';
+import { zcodeRequest, responseJson } from './zcgw-upstream.mjs';
+import { billingHeaders, parseClaimPlan, parseMarketingPlans, mergeClaimPlans, parseCurrentPlans, effectiveAt, claimFailure } from './zcgw-claim.mjs';
 import { metadataUserId, sessionIdFor, requestId, userIdFromJwt, deviceIdFor } from './zcgw-fingerprint.mjs';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
@@ -46,12 +49,13 @@ function panelAuthed(req) {
 }
 const UPSTREAM_ORIGIN = process.env.ZCODE_UPSTREAM_ORIGIN || 'https://zcode.z.ai';
 const UPSTREAM_URL = `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`;
-const APP_VERSION = process.env.ZCODE_APP_VERSION || '3.16.3';
 const DEFAULT_MODEL = process.env.ZCODE_MODEL || 'GLM-5.3-Flash';
 const VERBOSE = process.env.ZCGW_VERBOSE === '1';
 const PROFILE_FILE = path.join(import.meta.dirname, 'zcode-profile.json');
 // 数据文件目录：Docker 里指向挂载卷 /app/data，本机默认与程序同目录
 const DATA_DIR = process.env.ZCGW_DATA_DIR || import.meta.dirname;
+const clientVersion = createVersionManager({ dataDir: DATA_DIR,
+  url: process.env.ZCODE_CHANGELOG_URL || `${UPSTREAM_ORIGIN}/cn/changelog`, configuredVersion: process.env.ZCODE_APP_VERSION });
 
 const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
 const GATEWAY_VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
@@ -161,7 +165,7 @@ function realmFromCustomer(d) {
 
 /** Use an authorized profile ID; the gateway JWT may identify a different namespace. */
 function profileUserId(profile) {
-  for (const key of ['user_id', 'customerNumber', 'sub', 'id']) {
+  for (const key of ['id', 'user_id', 'customerNumber', 'sub']) {
     const value = profile?.[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
@@ -390,6 +394,7 @@ function persistAccount(jwt, label, extra = {}) {
   const activationUserId = typeof extra.activationUserId === 'string' ? extra.activationUserId.trim() : '';
   const existing = arr.find((a) => userIdFromJwt(a.jwt) === uid);
   if (existing) {
+    existing.jwt = jwt;
     if (email) existing.email = email;
     if (extra.name) existing.name = extra.name;
     if (extra.phone) existing.phone = extra.phone;
@@ -747,9 +752,9 @@ function upstreamHeaders(acc) {
     'content-type': 'application/json',
     'anthropic-version': '2023-06-01',
     'anthropic-beta': 'mid-conversation-system-2026-04-07',
-    'user-agent': `ZCode/${APP_VERSION} ai-sdk/provider-utils/4.0.27 runtime/node.js/24`,
+    'user-agent': `ZCode/${clientVersion.reported()} ai-sdk/provider-utils/4.0.27 runtime/node.js/24`,
     'http-referer': UPSTREAM_ORIGIN,
-    'x-zcode-app-version': APP_VERSION,
+    'x-zcode-app-version': clientVersion.reported(),
     'x-title': 'Z Code@electron',
     'x-release-channel': 'production',
     'x-platform': 'linux-x64',
@@ -771,6 +776,12 @@ function upstreamHeaders(acc) {
 
 function buildUserId(acc) {
   return metadataUserId(acc.uid);
+}
+
+/** zcode-switch's billing identity is separate from chat/inference headers. */
+function accountBillingHeaders(acc, version = clientVersion.reported()) {
+  if (acc?.local) acc.jwt = localJwt() || acc.jwt;
+  return billingHeaders({ token: acc?.jwt || '', deviceId: acc?.deviceId, version, origin: UPSTREAM_ORIGIN });
 }
 
 /**
@@ -1513,19 +1524,15 @@ async function handleQuota(req, res) {
   sendJson(res, 200, { accounts: out });
 }
 
-async function quotaJson(url, headers, { allowEmptyData = false, notFoundIsEmpty = false } = {}) {
-  const r = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-  const j = await safeJson(r);
-  // Only billing/preview uses 404 to mean that no activity is being offered.
-  if (notFoundIsEmpty && r.status === 404) return {};
+async function quotaJson(url, headers, { billing = false } = {}) {
+  const r = billing ? await zcodeRequest(url, { headers, timeoutMs: 15000 }) : await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  const j = billing ? responseJson(r) : await safeJson(r);
   if (!r.ok || !j || typeof j !== 'object' || Array.isArray(j) || j.__error || j.success === false || ![0, 200, '0', '200'].includes(j.code)) {
     // Never echo upstream payloads, which may contain credentials or personal data.
     const code = j?.code ?? j?.provider_code;
     const codeText = code != null && String(code).trim() && Number.isFinite(Number(code)) ? Number(code) : '未知';
     throw new Error(`查询失败（HTTP ${r.status}，业务码 ${codeText}）`);
   }
-  // Eligibility endpoints may omit data on success. Balance endpoints still require it.
-  if (allowEmptyData && j.data == null) return {};
   if (!j.data || typeof j.data !== 'object' || Array.isArray(j.data)) throw new Error('查询响应缺少有效 data');
   return j.data;
 }
@@ -1534,7 +1541,7 @@ function sourceName(acc, id) {
   return id === 'billing' ? 'ZCode 套餐' : `${acc.codingPlanProvider === 'bigmodel' ? 'BigModel' : 'Z.ai'} Coding Plan`;
 }
 
-async function refreshQuotaSource(acc, id) {
+async function refreshQuotaSource(acc, id, version) {
   const key = `${acc.label}:${id}`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
   const run = (async () => {
@@ -1544,7 +1551,7 @@ async function refreshQuotaSource(acc, id) {
     try {
       let plans;
       if (id === 'billing') {
-        const q = await quotaOf(acc);
+        const q = await quotaOf(acc, version);
         plans = q.plans;
         setQuotaCache([{ label: acc.label, ...q }]);
       } else {
@@ -1571,86 +1578,50 @@ async function refreshQuotaSource(acc, id) {
   try { return await run; } finally { accountRefreshes.delete(key); }
 }
 
-async function refreshQuotaAccount(acc) {
-  return Promise.all(['billing', 'coding'].map((id) => refreshQuotaSource(acc, id)));
+async function refreshQuotaAccount(acc, version) {
+  return Promise.all(['billing', 'coding'].map((id) => refreshQuotaSource(acc, id, version)));
 }
 
-function parseClaimPlan(p) {
-  if (!p || typeof p !== 'object') return null;
-  const id = p.plan_id ?? p.planId;
-  const planId = typeof id === 'string' ? id.trim() : '';
-  if (!planId) return null;
-  return {
-    planId,
-    name: (typeof p.name === 'string' && p.name.trim()) || planId,
-    description: typeof p.description === 'string' ? p.description.trim() : '',
-    priority: Number.isFinite(p.priority) ? p.priority : 0,
-    entitlements: (Array.isArray(p.entitlements) ? p.entitlements : []).filter((e) => e && typeof e === 'object')
-      .map((e) => ({ model: e.show_name, grant: e.grant_units, period: e.period })),
-  };
-}
-
-/** Match zcode-switch: successful empty data/plans and preview 404 mean no offers. */
-async function claimableFor(acc) {
-  const headers = upstreamHeaders(acc);
-  const query = new URLSearchParams({ app_version: APP_VERSION, platform: headers['x-platform'] });
-  const data = await quotaJson(
-    `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/preview?${query}`,
-    headers,
-    { allowEmptyData: true, notFoundIsEmpty: true },
-  );
-  const list = data.plans ?? [];
-  if (!Array.isArray(list)) throw new Error('资格响应的 plans 格式不正确');
-  const plans = list.map(parseClaimPlan).filter(Boolean);
-  return { plans, rawCode: 0, rawMsg: '' };
-}
-
-// ── 领取资格：双通道（对齐 zcode-switch）──
-// billing/preview 只是其一；新版活动（客户端弹窗/banner）只经 marketing/touch 下发，
-// deliveries 按钮带 claim_zcode_plan 的 plan_id。2026-11 的 GLOBAL BUILD 活动实测只出现在
-// marketing 通道 —— 只猜日期编码会永远领不到。
-
-/** Deliveries carry both claim buttons and full plans inside background/hero payloads. */
-function collectMarketingPlans(v, plans, buttonIds) {
-  if (Array.isArray(v)) {
-    for (const it of v) collectMarketingPlans(it, plans, buttonIds);
-  } else if (v && typeof v === 'object') {
-    const action = v.action;
-    if (action && typeof action === 'object') {
-      const ty = action.type || '';
-      if (ty === 'claim_zcode_plan' || ty === 'claim_plan') {
-        const id = action.args?.plan_id ?? action.planId;
-        if (typeof id === 'string' && id.trim()) buttonIds.add(id.trim());
-      }
+/** Query in the same order as zcode-switch, retaining each channel's diagnostics. */
+async function eligibilityChannel(acc, channel, version) {
+  const headers = accountBillingHeaders(acc, version);
+  const query = new URLSearchParams({ app_version: version, platform: headers['x-platform'] });
+  const route = channel === 'marketing' ? 'marketing/touch?seq=0' : `zcode-plan/billing/${channel}?${query}`;
+  const field = channel === 'marketing' ? 'deliveries' : 'plans';
+  const meta = { status: null, code: null, count: 0, parsedCount: 0, transport: null, error: null };
+  try {
+    const response = await zcodeRequest(`${UPSTREAM_ORIGIN}/api/v1/${route}`, { headers, timeoutMs: CLAIM_TIMEOUT_MS });
+    const body = responseJson(response);
+    meta.status = response.status;
+    meta.transport = response.transport;
+    meta.code = body?.code != null && Number.isFinite(Number(body.code)) ? Number(body.code) : null;
+    if (channel === 'preview' && response.status === 404) return { plans: [], meta };
+    if (!response.ok || !body || body.success === false || ![0, '0'].includes(body.code)) {
+      throw new Error(`查询失败（HTTP ${response.status}，业务码 ${meta.code ?? '未知'}）`);
     }
-    if (typeof v.name === 'string' || Array.isArray(v.entitlements)) {
-      const plan = parseClaimPlan(v);
-      if (plan && !plans.has(plan.planId)) plans.set(plan.planId, plan);
-    }
-    for (const val of Object.values(v)) collectMarketingPlans(val, plans, buttonIds);
+    if (body.data != null && (typeof body.data !== 'object' || Array.isArray(body.data))) throw new Error('查询响应的 data 格式不正确');
+    const list = body.data?.[field] ?? [];
+    if (!Array.isArray(list)) throw new Error(`查询响应的 ${field} 格式不正确`);
+    meta.count = list.length;
+    const plans = channel === 'marketing' ? parseMarketingPlans(list)
+      : channel === 'current' ? parseCurrentPlans(list) : list.map(parseClaimPlan).filter(Boolean);
+    meta.parsedCount = plans.length;
+    return { plans, meta };
+  } catch (error) {
+    meta.error = error.message;
+    return { plans: [], meta };
   }
 }
 
-/** Both channels are queried independently; failure is not an empty eligibility result. */
-async function marketingClaimablePlans(acc) {
-  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/marketing/touch?seq=0`, upstreamHeaders(acc), { allowEmptyData: true });
-  const deliveries = data.deliveries ?? [];
-  if (!Array.isArray(deliveries)) throw new Error('活动响应的 deliveries 格式不正确');
-  const plans = new Map();
-  const buttonIds = new Set();
-  for (const d of deliveries) collectMarketingPlans(d, plans, buttonIds);
-  for (const id of buttonIds) if (!plans.has(id)) plans.set(id, parseClaimPlan({ plan_id: id }));
-  return [...plans.values()];
-}
-
-/** Manual refresh mirrors zcode-switch's activation sequence, without submitting a claim. */
-async function activateEligibility(acc) {
+/** Manual activation uses the OAuth identity and the same version/device as discovery. */
+async function activateEligibility(acc, version) {
   const key = `${acc.label}:activation`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
   if (acc.local) acc.activationUserId = localActivationUserId();
   const identity = acc.activationUserId || null;
+  const fingerprint = JSON.stringify([identity, acc.deviceId, version]);
   const previous = activationCache.get(acc.label);
-  if (previous?.identity === identity && Date.parse(previous.state.retryAt) > Date.now()) return previous.state;
+  if (previous?.fingerprint === fingerprint && Date.parse(previous.state.retryAt) > Date.now()) return previous.state;
   const run = (async () => {
     const checkedAt = new Date().toISOString();
     const retryAt = new Date(Date.now() + 60_000).toISOString();
@@ -1659,34 +1630,32 @@ async function activateEligibility(acc) {
       state = { status: 'unavailable', checkedAt, retryAt, error: '缺少授权用户信息，未执行资格激活；请重新登录该账号，现有套餐查询仍可使用' };
     } else {
       try {
-        const headers = upstreamHeaders(acc);
+        const headers = accountBillingHeaders(acc, version);
         for (const element of ['app_launch', 'app_daily_active']) {
-          const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/event/report`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            signal: AbortSignal.timeout(10000),
+          const response = await zcodeRequest(`${UPSTREAM_ORIGIN}/api/v1/event/report`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, timeoutMs: 10000,
             body: JSON.stringify({
               event_id: crypto.randomUUID(), element_name: element,
               event_region: 'app', event_type: 'view', event_text: '', event_extra_detail: {},
               user_id: identity, device_mid: acc.deviceId,
-              app_version: APP_VERSION, client_timezone: headers['x-client-timezone'],
+              app_version: version, client_timezone: headers['x-client-timezone'],
               client_language: headers['x-client-language'],
               device_os_category: headers['x-os-category'], device_os_version: headers['x-os-version'],
               screen_resolution: '2560x1440', mac_id: '', marketing_params: '{}',
             }),
           });
-          const j = await safeJson(r);
-          if (!r.ok || !j || j.__error || j.success === false || ![0, '0'].includes(j.code)) {
-            const code = j?.code ?? j?.provider_code;
-            const codeText = code != null && Number.isFinite(Number(code)) ? Number(code) : '未知';
-            throw new Error(`资格激活失败（HTTP ${r.status}，业务码 ${codeText}）`);
+          const body = responseJson(response);
+          if (!response.ok || !body || body.success === false || ![0, '0'].includes(body.code)) {
+            const code = body?.code;
+            throw new Error(`资格激活失败（HTTP ${response.status}，业务码 ${code != null && Number.isFinite(Number(code)) ? Number(code) : '未知'}）`);
           }
         }
         state = { status: 'ready', checkedAt, retryAt, error: null };
-      } catch (e) {
-        state = { status: 'error', checkedAt, retryAt, error: e.message.startsWith('资格激活失败') ? e.message : '资格激活请求失败或超时，已继续查询套餐' };
+      } catch (error) {
+        state = { status: 'error', checkedAt, retryAt, error: error.message.startsWith('资格激活失败') ? error.message : '资格激活请求失败或超时，已继续查询套餐' };
       }
     }
-    activationCache.set(acc.label, { identity, state });
+    activationCache.set(acc.label, { fingerprint, state });
     return state;
   })();
   accountRefreshes.set(key, run);
@@ -1697,13 +1666,14 @@ async function refreshAccountEligibility(acc) {
   const key = `${acc.label}:manual-refresh`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
   const run = (async () => {
+    const version = await clientVersion.ensureFresh();
     const [sources, eligibility] = await Promise.all([
-      refreshQuotaAccount(acc),
+      refreshQuotaAccount(acc, version.reported),
       (async () => {
-        await activateEligibility(acc);
+        await activateEligibility(acc, version.reported);
         // A read-only lookup started before activation must not supply this result.
         await accountRefreshes.get(`${acc.label}:eligibility`);
-        return refreshEligibility(acc);
+        return refreshEligibility(acc, version);
       })(),
     ]);
     return { quotaSources: sources, eligibility };
@@ -1712,28 +1682,23 @@ async function refreshAccountEligibility(acc) {
   try { return await run; } finally { accountRefreshes.delete(key); }
 }
 
-async function refreshEligibility(acc) {
+async function refreshEligibility(acc, version) {
   const key = `${acc.label}:eligibility`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
   const run = (async () => {
-    const results = await Promise.allSettled([claimableFor(acc), marketingClaimablePlans(acc)]);
-    const plans = new Map();
-    const errors = [];
-    if (results[0].status === 'fulfilled') {
-      for (const p of results[0].value.plans) plans.set(p.planId, p);
-    } else errors.push(`套餐资格：${results[0].reason.message}`);
-    if (results[1].status === 'fulfilled') {
-      for (const p of results[1].value) {
-        const existing = plans.get(p.planId);
-        if (!existing) plans.set(p.planId, p);
-        else if (!existing.description) existing.description = p.description;
-      }
-    } else errors.push(`活动资格：${results[1].reason.message}`);
+    version ||= await clientVersion.ensureFresh();
+    const started = Date.now();
+    const preview = await eligibilityChannel(acc, 'preview', version.reported);
+    const marketing = await eligibilityChannel(acc, 'marketing', version.reported);
+    const current = await eligibilityChannel(acc, 'current', version.reported);
+    const errors = [preview.meta.error && `套餐资格：${preview.meta.error}`, marketing.meta.error && `活动资格：${marketing.meta.error}`].filter(Boolean);
     const state = {
       status: errors.length === 2 ? 'error' : errors.length ? 'partial' : 'ready',
-      plans: [...plans.values()].sort((a, b) => b.priority - a.priority || a.planId.localeCompare(b.planId)),
+      plans: mergeClaimPlans(preview.plans, marketing.plans),
+      currentPlans: current.plans, currentError: current.meta.error,
       checkedAt: new Date().toISOString(), error: errors.join('；') || null,
       activation: activationCache.get(acc.label)?.state || null,
+      version, diagnostics: { preview: preview.meta, marketing: marketing.meta, current: current.meta, elapsedMs: Date.now() - started },
     };
     eligibilityCache.set(acc.label, state);
     return state;
@@ -1742,135 +1707,73 @@ async function refreshEligibility(acc) {
   try { return await run; } finally { accountRefreshes.delete(key); }
 }
 
-async function claimCandidates(acc, planId) {
-  if (planId) return [planId];
+// The reference validates the chosen offer before opening captcha and consumes it once.
+const pendingClaims = new Map();
+const claimsInFlight = new Set();
+const claimIdentity = (acc) => crypto.createHash('sha256').update(`${acc.jwt}:${acc.deviceId}`).digest('hex');
+async function prepareClaim(acc, planId) {
   const state = await refreshEligibility(acc);
-  if (state.status !== 'ready' && !state.plans.length) throw new Error(state.error);
-  return state.plans.map((p) => p.planId);
+  const plan = planId ? state.plans.find((p) => p.planId === planId) : state.plans[0];
+  if (!plan) throw new Error(state.error || (planId ? '该套餐已不在可领取列表，请刷新资格后重试' : '暂无可领取套餐'));
+  const prepared = { preparationId: crypto.randomUUID(), plan, version: state.version.reported,
+    identity: claimIdentity(acc), expiresAt: Date.now() + 10 * 60_000 };
+  pendingClaims.set(acc.label, prepared);
+  return prepared;
 }
 
-// ── 阿里云验证码配置（claim 必带 X-Aliyun-Captcha-Verify-Param，否则 3007）──
 let captchaConfigCache = { ts: 0, cfg: null };
 const CAPTCHA_CFG_DEFAULT = { enabled: true, region: 'cn', prefix: 'no8xfe', sceneId: '11xygtvd' };
-
 async function captchaConfig() {
   if (captchaConfigCache.cfg && Date.now() - captchaConfigCache.ts < 600_000) return captchaConfigCache.cfg;
   try {
-    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/client/configs`, {
-      headers: { 'user-agent': `ZCode/${APP_VERSION}`, 'http-referer': UPSTREAM_ORIGIN },
-      signal: AbortSignal.timeout(8000),
+    const response = await zcodeRequest(`${UPSTREAM_ORIGIN}/api/v1/client/configs`, {
+      headers: accountBillingHeaders(null), timeoutMs: CLAIM_TIMEOUT_MS,
     });
-    const j = await safeJson(r);
-    const c = j.data?.configs?.captcha;
-    const cfg = c && c.enabled
-      ? { enabled: true, region: c.region || 'cn', prefix: c.prefix || 'no8xfe', sceneId: c.sceneId || '11xygtvd' }
-      : CAPTCHA_CFG_DEFAULT;
+    const body = responseJson(response);
+    if (!response.ok || ![0, '0'].includes(body?.code)) throw new Error();
+    const c = body.data?.configs?.captcha;
+    const cfg = { enabled: c?.enabled === true, region: typeof c?.region === 'string' ? c.region : '',
+      prefix: typeof c?.prefix === 'string' ? c.prefix : '', sceneId: typeof c?.sceneId === 'string' ? c.sceneId : '' };
     captchaConfigCache = { ts: Date.now(), cfg };
     return cfg;
   } catch {
-    return captchaConfigCache.cfg || CAPTCHA_CFG_DEFAULT;
+    captchaConfigCache = { ts: Date.now(), cfg: captchaConfigCache.cfg || CAPTCHA_CFG_DEFAULT };
+    return captchaConfigCache.cfg;
   }
 }
 
-/** 从 balance 里看当前已激活的非日包（周末包等） */
-async function activeGrants(acc) {
+/** Exactly one selected plan per captcha; every business failure is terminal. */
+async function claimFor(acc, planId, captchaParam, captchaRegion, preparationId) {
+  if (!captchaParam) return { ok: false, code: 'captcha_required', msg: '需要人机验证：请从面板发起领取' };
+  if (claimsInFlight.has(acc.label)) return { ok: false, code: 'claim_pending', msg: '该账号正在领取，请等待本次结果' };
+  claimsInFlight.add(acc.label);
   try {
-    const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, {
-      headers: upstreamHeaders(acc),
-      signal: AbortSignal.timeout(20000),
-    });
-    const j = await safeJson(r);
-    const now = Date.now() / 1000;
-    return (j.data?.plans ?? []).filter((p) => p.status === 'active' && (p.ends_at ?? 0) > now);
-  } catch {
-    return [];
-  }
-}
-
-/** Discover candidates from preview and marketing; one captcha authorizes one claim. */
-async function claimFor(acc, planId, captchaParam) {
-  if (!captchaParam || !captchaParam.trim()) {
-    // 上游 claim 已强制阿里云人机验证（3007 captcha verify failed），无验证参数直接拒绝，
-    // 避免白白消耗候选重试。前端负责跑阿里云 SDK 拿 captchaVerifyParam。
-    return { ok: false, code: 'captcha_required', msg: '需要人机验证：请从面板发起领取（会自动完成无痕验证）' };
-  }
-  const candidates = await claimCandidates(acc, planId);
-  const captchaHeaders = {
-    'x-aliyun-captcha-verify-param': captchaParam.trim(),
-  };
-
-  const tried = [];
-  const claimed = [];
-  const dup = [];
-  const deadline = Date.now() + Number(process.env.ZCGW_CLAIM_BUDGET_MS || 25000);
-  for (const pid of [...new Set(candidates)]) {
-    if (Date.now() > deadline) {
-      tried.push({ planId: '(...)', code: 'budget', msg: '候选太多，已超时中止' });
-      break;
-    }
-    let j = null;
-    try {
-      const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/claim`, {
-        method: 'POST',
-        headers: { ...upstreamHeaders(acc), ...captchaHeaders },
-        body: JSON.stringify({ plan_id: pid }),
-        signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
-      });
-      const text = await r.text();
-      try {
-        j = JSON.parse(text);
-      } catch {
-        tried.push({ planId: pid, code: `http-${r.status}`, msg: text.slice(0, 80) || '(空响应)' });
-        continue;
+    if (acc.local) acc.jwt = localJwt() || acc.jwt;
+    let pending;
+    if (preparationId) {
+      pending = pendingClaims.get(acc.label);
+      if (!pending || pending.preparationId !== preparationId || pending.expiresAt <= Date.now()
+        || pending.identity !== claimIdentity(acc) || (planId && pending.plan.planId !== planId)) {
+        return { ok: false, code: 'preparation_expired', msg: '领取准备已失效，请重新发起领取' };
       }
-    } catch (e) {
-      tried.push({ planId: pid, code: 'network', msg: e.message });
-      continue;
-    }
-
-    const code = j.code;
-    const msg = j.data?.message || j.msg || '';
-    tried.push({ planId: pid, code, msg });
-    log(`[${acc.label}] claim ${pid} -> ${code} ${msg}`);
-
-    // 3007 验证码校验失败（参数过期/已用）：验证参数是一次性的，换下一个候选也没用，直接终态
-    if (code === 3007) {
-      return { ok: false, code: 3007, msg: '验证码参数已过期或已使用，请重新发起领取', tried };
-    }
-    // 领到了：验证参数已消费，收工（一次验证领一个套餐）
-    if (code === 0 && j.data?.plan) {
-      claimed.push({ planId: pid, plan: j.data.plan });
-      break;
-    }
-    // 1003 已领过：记下来，不阻断其它候选
-    if (code === 1003) {
-      dup.push({ planId: pid, msg });
-      continue;
-    }
-    // 1001 套餐不存在：继续试下一个候选
-  }
-
-  if (claimed.length) {
-    return {
-      ok: true,
-      claimed: claimed.map((c) => c.planId).join(', '),
-      claimedList: claimed.map((c) => c.planId),
-      alreadyClaimedPlans: dup.map((d) => d.planId),
-      tried,
-    };
-  }
-  if (dup.length) {
-    // 1003 only means already claimed; it provides no evidence of expiry.
-    return {
-      ok: true,
-      alreadyClaimed: true,
-      claimed: dup[0].planId,
-      upstreamMsg: dup[0].msg || '',
-      msg: '该套餐已领取，无需重复领取；有效期请查看套餐额度',
-      tried,
-    };
-  }
-  return { ok: false, msg: tried.at(-1)?.msg || '没有可领取的套餐', tried };
+    } else pending = await prepareClaim(acc, planId);
+    pendingClaims.delete(acc.label);
+    const pid = pending.plan.planId;
+    const response = await zcodeRequest(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/claim`, {
+      method: 'POST', headers: { ...accountBillingHeaders(acc, pending.version),
+        'x-aliyun-captcha-verify-param': captchaParam,
+        ...(captchaRegion ? { 'x-aliyun-captcha-verify-region': captchaRegion } : {}),
+      }, body: JSON.stringify({ plan_id: pid }), timeoutMs: CLAIM_TIMEOUT_MS, retryTransport: false,
+    });
+    const body = responseJson(response);
+    const code = body?.code != null && Number.isFinite(Number(body.code)) ? Number(body.code) : -1;
+    log(`[${acc.label}] claim ${pid} -> HTTP ${response.status} code ${code}`);
+    if (!response.ok || ![0, '0'].includes(body?.code) || body?.success === false) return claimFailure(code, response, body);
+    const millis = (v) => Number.isFinite(v) ? v * 1000 : null;
+    return { ok: true, claimed: pid, claimedList: [pid], planName: pending.plan.name,
+      startsAt: millis(body?.data?.plan?.starts_at), endsAt: millis(body?.data?.plan?.ends_at),
+      effectiveAt: effectiveAt(body?.data?.plan), serverTime: millis(body?.data?.server_time) };
+  } finally { claimsInFlight.delete(acc.label); }
 }
 
 /** Legacy endpoint shares the same eligibility result as the console. */
@@ -1883,43 +1786,31 @@ async function handleClaimable(req, res) {
   sendJson(res, 200, { accounts: out });
 }
 
-/** 一键领取：POST { label?, planId? } */
+/** Legacy and console endpoints use one account and one captcha per submission. */
 async function handleClaim(req, res, labelOverride) {
   const raw = await readBody(req);
-  let body = {};
-  try {
-    body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
-  } catch {}
-
+  let body;
+  try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; }
+  catch { return sendJson(res, 400, { error: '请求不是有效 JSON' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(res, 400, { error: '请求必须是 JSON 对象' });
   const targetLabel = labelOverride || body.label;
-  // 上游 claim 强制阿里云人机验证：无验证参数时直接给出明确错误（前端负责跑 SDK 拿参数）
-  const captchaParam = String(body.captchaParam || body.captchaVerifyParam || '').trim();
-  if (!captchaParam) {
-    return sendJson(res, 200, {
-      results: [{ label: targetLabel ?? '(all)', ok: false, code: 'captcha_required', msg: '需要人机验证：请从面板「账号管理」的领取按钮发起（会自动完成无痕验证）' }],
-    });
-  }
-  // 一键领取只处理已启用账号；指定 label 时精确到号（停用号保留领取资格）
-  const targets = targetLabel
-    ? accounts.filter((a) => a.label === targetLabel)
-    : accounts.filter((a) => !a.disabled);
-  const results = [];
-  for (const acc of targets) {
-    try {
-      const result = await claimFor(acc, body.planId, captchaParam);
-      results.push({ label: acc.label, ...result });
-      if (result.ok) await Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]);
-    } catch (e) {
-      results.push({ label: acc.label, ok: false, msg: e.message });
-    }
-  }
-  sendJson(res, 200, { results });
+  const targets = targetLabel ? accounts.filter((a) => a.label === targetLabel) : accounts.filter((a) => !a.disabled);
+  if (!targets.length) return sendJson(res, 404, { error: '找不到账号' });
+  if (targets.length !== 1) return sendJson(res, 400, { error: '一次验证只能领取一个账号的一个套餐，请指定账号' });
+  const acc = targets[0];
+  const field = (name) => typeof body[name] === 'string' ? body[name].trim() : '';
+  let result;
+  try {
+    result = await claimFor(acc, field('planId'), field('captchaParam') || field('captchaVerifyParam'), field('captchaRegion'), field('preparationId'));
+    if (result.ok || result.alreadyClaimed) await Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]);
+  } catch (error) { result = { ok: false, msg: error.message }; }
+  sendJson(res, 200, { results: [{ label: acc.label, ...result }] });
 }
 
-// ── 无头登录（设备授权流）：登录即纳管，纳管即自动领取 ──
+// ── 无头登录（设备授权流）：登录后保存授权身份 ──
 // flow 要落盘：网关重启不该把你正在等的那次授权弄丢
 const FLOW_FILE = path.join(DATA_DIR, 'onboard-flows.json');
-// 领领取的速度：每个候选 15s 就够，否则一个卡死的候选会拖到分钟级
+// 每个上游资格/领取请求的超时。
 const CLAIM_TIMEOUT_MS = Number(process.env.ZCGW_CLAIM_TIMEOUT_MS || 15000);
 
 function readFlows() {
@@ -1944,8 +1835,9 @@ const pendingFlows = readFlows(); // flowId -> { pollToken, createdAt }
 
 
 /** 读某个账号的余额（统一格式，带中文标签） */
-async function quotaOf(acc) {
-  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, upstreamHeaders(acc));
+async function quotaOf(acc, version) {
+  version ||= (await clientVersion.ensureFresh()).reported;
+  const data = await quotaJson(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/balance?app_version=${version}`, accountBillingHeaders(acc, version), { billing: true });
   if (!Array.isArray(data.plans) || !Array.isArray(data.balances)) throw new Error('套餐余额响应缺少 plans / balances');
   const plans = normalizeBilling(data).map((p) => {
     const d = describePlan(p.id, p.name);
@@ -2781,7 +2673,7 @@ function buildOverview() {
     idleWeightMax: POOL.idleWeightMax,
     weightBalFactor: POOL.weightBalFactor,
     weightSuccFactor: POOL.weightSuccFactor,
-    weekendGrab: true,
+    weekendGrab: false,
     limits: POOL_LIMITS,
   };
   return { accounts: mapped, settings, hourly, stats };
@@ -2889,7 +2781,7 @@ async function handleConsoleApi(req, res, url) {
     return sendJson(res, 200, { key: GATEWAY_KEY });
   }
   // PATCH /api/accounts/:id —— 启用停用 + 身份字段
-  const mAcc = p.match(/^\/api\/accounts\/(.+?)(?:\/(selftest|claim|refresh))?$/);
+  const mAcc = p.match(/^\/api\/accounts\/(.+?)(?:\/(selftest|claim\/start|claim|refresh))?$/);
   if (mAcc) {
     const id = decodeURIComponent(mAcc[1]);
     const sub = mAcc[2];
@@ -2924,6 +2816,16 @@ async function handleConsoleApi(req, res, url) {
         markFailure(acc, 60_000);
         return sendJson(res, 502, { ok: false, error: e.message, account: id });
       }
+    }
+    if (sub === 'claim/start' && req.method === 'POST') {
+      const acc = accounts.find((a) => a.label === id);
+      if (!acc) return sendJson(res, 404, { error: '找不到账号' });
+      try {
+        const raw = await readBody(req);
+        const body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
+        const prepared = await prepareClaim(acc, typeof body.planId === 'string' ? body.planId.trim() : '');
+        return sendJson(res, 200, { preparationId: prepared.preparationId, plan: prepared.plan, expiresAt: prepared.expiresAt });
+      } catch (error) { return sendJson(res, 409, { error: error.message }); }
     }
     if (sub === 'claim' && req.method === 'POST') {
       return handleClaim(req, res, id);
@@ -3037,6 +2939,7 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 200, {
       ok: true,
       version: GATEWAY_VERSION,
+      zcodeVersion: clientVersion.snapshot(),
       accounts: accounts.length,
       keys: keyDb.keys.filter((k) => !k.deleted).length,
       upstream: UPSTREAM_URL,
@@ -3183,47 +3086,8 @@ server.listen(PORT, HOST, () => {
   setInterval(refreshQuotaWeights, 10 * 60_000); // 每 10 分钟刷一次权重缓存
   setInterval(savePoolState, 60_000); // 每分钟落盘一次调度状态
 
-  // 周末额度自动抢领：周五 18:00 ～ 周日 24:00（北京时间）每 10 分钟试一轮，
-  // 抢到即停；名额开闸第一时间拿到，避免 1005 名额已用完
-  const WEEKEND_GRAB = (() => {
-    try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'pool-settings.json'), 'utf8')).weekendGrab ?? true; }
-    catch { return true; }
-  })();
-  if (WEEKEND_GRAB) {
-    const grabTick = async () => {
-      try {
-        const bj = new Date(Date.now() + 8 * 3600_000);
-        const day = bj.getUTCDay(), hour = bj.getUTCHours();
-        // 周五(5) 18 点后 / 周六(6) 全天 / 周日(0) 24 点前
-        const inWindow = (day === 5 && hour >= 18) || day === 6 || (day === 0);
-        if (!inWindow) return;
-        // 找缺 promo 的号（有访问资格才领）；手动停用的号不碰
-        for (const acc of accounts.filter((a) => !a.disabled)) {
-          const active = await activeGrants(acc);
-          const kinds = new Set(active.map((p) => describePlan(p.plan_id, p.name).kind));
-          if (kinds.has('promo')) continue;
-          const r = await fetch(`http://127.0.0.1:${PORT}/claim`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ label: acc.label }),
-          });
-          const j = await safeJson(r);
-          const x = (j.results ?? [])[0] ?? {};
-          if (x.code === 'captcha_required') {
-            // 上游强制人机验证，服务端后台任务拿不到验证参数 —— 首轮提示一次即可
-            log('[weekend-grab] 上游 claim 需要人机验证（阿里云验证码），后台自动抢领已不可用；请从面板手动领取');
-            return;
-          }
-          if (x.ok && !x.alreadyClaimed) log(`[weekend-grab] ${acc.label} 抢领成功：${x.claimed}`);
-          else if (x.code === 1005) log(`[weekend-grab] ${acc.label} 1005 名额未开/已尽，下轮再试`);
-        }
-      } catch (e) {
-        if (VERBOSE) log('[weekend-grab] tick error:', e.message);
-      }
-    };
-    setInterval(grabTick, 10 * 60_000);
-    setTimeout(grabTick, 15_000);
-    log('weekend-grab: 周末额度自动抢领已启用（周五18:00 起）');
-  }
+  // Claims require a fresh interactive captcha for a selected account and plan.
+  // Do not run the obsolete background candidate loop without a captcha.
 
   // 启动后自动补齐身份：先吃本地客户端的 access_token，再拿官方客户档案反查邮箱/手机号
   setTimeout(async () => {
