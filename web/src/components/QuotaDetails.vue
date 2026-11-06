@@ -18,19 +18,23 @@ const visibleSources = computed(() => visibleQuotaSources(props.sources))
       <div v-for="plan in source.plans" :key="plan.id" class="quota-plan">
         <div class="quota-plan-name" :title="plan.id">{{ plan.name }}</div>
         <span v-if="plan.endsAt" class="quota-updated">到期 {{ time(plan.endsAt, true) }}</span>
-        <div v-for="item in plan.items" :key="item.id" class="quota-item">
-          <span class="quota-item-name">{{ item.name }}</span>
-          <div class="quota-numbers">
-            <strong>{{ number(item.remaining, 1) }}</strong>
-            <span>/ {{ number(item.total, 1) }} {{ item.unit }}</span>
-            <span>{{ item.remainingPercent === null ? '比例未知' : `${number(item.remainingPercent, 1)}%` }}</span>
+        <div class="quota-items">
+          <div v-for="item in plan.items" :key="item.id" class="quota-item">
+            <div class="quota-item-header">
+              <span class="quota-item-name">{{ item.name }}</span>
+              <span class="quota-item-percent">{{ item.remainingPercent === null ? '比例未知' : `${number(item.remainingPercent, 1)}%` }}</span>
+            </div>
+            <div class="quota-numbers">
+              <strong>{{ number(item.remaining, 1) }}</strong>
+              <span>/ {{ number(item.total, 1) }} {{ item.unit }}</span>
+            </div>
+            <div v-if="item.remainingPercent !== null" class="quota-track" role="progressbar"
+              :aria-label="`${source.name} ${plan.name} ${item.name} 剩余比例`"
+              :aria-valuenow="item.remainingPercent" :aria-valuemin="0" :aria-valuemax="100">
+              <i :class="{ low: item.remainingPercent < 15 }" :style="{ width: `${item.remainingPercent}%` }" />
+            </div>
+            <span v-if="item.resetAt" class="quota-updated">重置 {{ time(item.resetAt, true) }}</span>
           </div>
-          <div v-if="item.remainingPercent !== null" class="quota-track" role="progressbar"
-            :aria-label="`${source.name} ${plan.name} ${item.name} 剩余比例`"
-            :aria-valuenow="item.remainingPercent" :aria-valuemin="0" :aria-valuemax="100">
-            <i :class="{ low: item.remainingPercent < 15 }" :style="{ width: `${item.remainingPercent}%` }" />
-          </div>
-          <span v-if="item.resetAt" class="quota-updated">重置 {{ time(item.resetAt, true) }}</span>
         </div>
       </div>
       <span v-if="source.syncedAt" class="quota-updated">更新于 {{ time(source.syncedAt, true) }}</span>

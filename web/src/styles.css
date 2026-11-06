@@ -1355,10 +1355,17 @@ button.button,
 .quota-source-name { display: block; font-size: 12px; color: var(--primary); }
 .quota-plan { margin-top: 10px; }
 .quota-plan-name { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
-.quota-item { margin-top: 8px; }
-.quota-item-name { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.quota-items { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; margin-top: 8px; }
+.quota-item { min-width: 0; overflow-wrap: anywhere; }
+.quota-item:only-child { grid-column: 1 / -1; }
+.quota-item-header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 8px; margin-bottom: 4px; }
+.quota-item-name { min-width: 0; font-size: 11px; color: var(--muted); }
+.quota-item-percent { flex-shrink: 0; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .quota-details .quota-track { max-width: none; margin-top: 4px; }
 .quota-details .quota-numbers { flex-wrap: wrap; white-space: normal; }
+@media (max-width: 800px) {
+  .quota-items { grid-template-columns: minmax(0, 1fr); }
+}
 .quota-details .quota-sync-state,
 .quota-cell .quota-sync-state { max-width: none; overflow-wrap: anywhere; }
 .quota-details + .eligibility-status { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
