@@ -227,7 +227,8 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 | `GET` | `/pool` `/quota` `/keys` `/stats` `/logs` `/security` `/pool/settings` | 面板 | 管理面板后端 |
 | `POST` | `/claim` `/pool/reset` `/selftest` | 面板 | 领取额度 / 解除冷却 / 连通自检 |
 | `POST` | `/accounts/add` `/accounts/update` `/accounts/identify` | 面板 | 账号纳管 / 修改 / 身份识别 |
-| `POST` | `/onboard/start` `/onboard/poll/{flowId}` | 面板 | 设备授权登录流 |
+| `POST` | `/api/onboard/start` `/api/onboard/redeem` | 面板 | 发起授权 / 提交授权回调链接；旧 `/onboard/*` 路径仍兼容 |
+| `GET` | `/api/onboard/poll/{flowId}` | 面板 | 轮询授权结果并保存账号 |
 | `POST` | `/keys` `/keys/{id}/update` `/keys/{id}/delete` `/keys/{id}/reset` | 面板 | 密钥管理 |
 | `GET/POST` | `/security` `/security/clear-blocked` | 面板 | IP 管控规则与审计 |
 

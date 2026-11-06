@@ -398,9 +398,9 @@ test('authenticated console refresh preserves distinct sources and partial failu
   await t.test('re-login persists the authorized profile and bypasses an unavailable activation cache', async () => {
     const before = activationEvents.length;
     const claimCount = claims;
-    const started = await api('/onboard/start', 'POST', { provider: 'bigmodel' });
+    const started = await api('/api/onboard/start', 'POST', { provider: 'bigmodel' });
     assert.equal(started.status, 200);
-    const loggedIn = await api(`/onboard/poll/${started.body.flowId}`);
+    const loggedIn = await api(`/api/onboard/poll/${started.body.flowId}`);
     assert.equal(loggedIn.status, 200);
     assert.equal(loggedIn.body.status, 'ready');
     assert.equal(loggedIn.body.added, false);
@@ -413,5 +413,14 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.deepEqual(activationEvents.slice(before).map((e) => e.body.user_id), ['reauthed-profile', 'reauthed-profile']);
     assert.equal(claims, claimCount);
     assert.ok(!JSON.stringify((await api('/api/overview')).body).includes('reauthed-profile'));
+
+    const redeemStart = await api('/api/onboard/start', 'POST', { provider: 'bigmodel' });
+    assert.equal(redeemStart.status, 200);
+    const redeemed = await api('/api/onboard/redeem', 'POST', {
+      flowId: redeemStart.body.flowId,
+      url: 'https://example.invalid/callback?code=test-code&state=test-login',
+    });
+    assert.equal(redeemed.status, 200);
+    assert.equal(redeemed.body.status, 'ready');
   });
 });

@@ -219,7 +219,7 @@ export async function api<T>(path: string, method = 'GET', data?: unknown): Prom
       result,
     )
     if (!response.ok) {
-      const rawMessage = result?.error?.message ?? result?.detail ?? result?.title
+      const rawMessage = (typeof result?.error === 'string' ? result.error : result?.error?.message) ?? result?.detail ?? result?.title
       const original = typeof rawMessage === 'string' ? rawMessage.slice(0, 1000) : null
       const source =
         diagnostics.source === 'cloudflare'

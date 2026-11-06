@@ -2789,6 +2789,17 @@ function buildOverview() {
 
 async function handleConsoleApi(req, res, url) {
   const p = url.pathname;
+  // The Vue API helper prefixes every path with /api; root aliases remain
+  // available for the legacy dashboard and scripts.
+  if (req.method === 'POST' && p === '/api/onboard/start') {
+    return handleOnboardStart(req, res);
+  }
+  if (req.method === 'POST' && p === '/api/onboard/redeem') {
+    return handleOnboardRedeem(req, res);
+  }
+  if (req.method === 'GET' && p.startsWith('/api/onboard/poll/')) {
+    return handleOnboardPoll(req, res, decodeURIComponent(p.slice('/api/onboard/poll/'.length)));
+  }
   // GET /api/overview —— 控制台主数据（cnb2api-console Overview 契约）
   if (req.method === 'GET' && p === '/api/overview') {
     return sendJson(res, 200, buildOverview());

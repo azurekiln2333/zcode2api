@@ -120,7 +120,7 @@ async function submitPaste() {
 async function finish() {
   stopPoll()
   finished.value = true
-  notify('登录成功，账号已纳管并自动领取')
+  notify('登录成功，账号已纳管；请刷新资格后领取套餐')
   window.dispatchEvent(new CustomEvent('zcgw-onboarded'))
   emit('close')
 }
@@ -130,7 +130,7 @@ const expireAt = () =>
 
 <template>
   <ModalShell
-    title="登录新账号并领取"
+    title="登录新账号"
     subtitle="国际号走 z.ai 登录页，国内号走 bigmodel 登录页，选错会卡在授权页。"
     wide
     @close="emit('close')"
@@ -151,8 +151,8 @@ const expireAt = () =>
             <span class="eyebrow">{{ key === 'zai' ? 'CHAT.Z.AI' : 'BIGMODEL.CN' }}</span>
           </button>
         </div>
-        <p v-if="starting" class="onboard-state" role="status">
-          <LoaderCircle :size="14" class="spin" />{{ stateText }}
+        <p v-if="stateText" class="onboard-state" :role="starting ? 'status' : 'alert'">
+          <LoaderCircle v-if="starting" :size="14" class="spin" />{{ stateText }}
         </p>
       </template>
       <template v-else>
@@ -160,7 +160,7 @@ const expireAt = () =>
           <span><CircleAlert :size="19" /></span>
           <div>
             <strong>第一步：在浏览器完成 ZCode 登录授权（{{ providerMeta[provider!].title }}）</strong>
-            <p>链接有效至 {{ expireAt() }} · 授权通过后自动纳管、自动领取、自动识别身份。</p>
+            <p>链接有效至 {{ expireAt() }} · 授权通过后自动纳管并识别身份；领取套餐需刷新资格并完成验证。</p>
           </div>
         </div>
         <div class="onboard-actions">
