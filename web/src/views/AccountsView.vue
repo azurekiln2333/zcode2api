@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onUnmounted } from 'vue'
+import { computed, ref, watch, onUnmounted, nextTick } from 'vue'
 import {
   Plus,
   RefreshCw,
@@ -41,6 +41,7 @@ import OnboardDialog from '../components/OnboardDialog.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import ModalShell from '../components/ModalShell.vue'
 import QuotaDetails from '../components/QuotaDetails.vue'
+import ClaimDetailsDialog from '../components/ClaimDetailsDialog.vue'
 
 const emit = defineEmits<{ navigate: [page: Page] }>()
 const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts, captchaState, captchaMessage, cancelClaim } = useConsole()
@@ -53,6 +54,9 @@ const showEditor = ref(false)
 const editingAccount = ref<Account | null>(null)
 const managingId = ref<string | null>(null)
 const managing = computed(() => accounts.value.find((a) => a.id === managingId.value) ?? null)
+const detailsAccountId = ref<string | null>(null)
+const detailsPlanId = ref<string>()
+const detailsAccount = computed(() => accounts.value.find((a) => a.id === detailsAccountId.value) ?? null)
 const showOnboard = ref(false)
 const onboardProvider = ref<'zai' | 'bigmodel' | null>(null)
 const page = ref(1)
@@ -129,6 +133,20 @@ async function rowAction(id: string, operation: 'probe' | 'quota', planId?: stri
     if (rowOps.value[id] === operation) delete rowOps.value[id]
   }
 }
+function openClaimDetails(id: string, planId?: string) {
+  managingId.value = null
+  detailsAccountId.value = id
+  detailsPlanId.value = planId
+  if (!accounts.value.find((account) => account.id === id)?.eligibility) void refreshQualifications([id])
+}
+async function claimFromDetails(planId: string) {
+  const account = detailsAccount.value
+  if (!account || busy.value.has(account.id)) return
+  detailsAccountId.value = null
+  // Close the native modal before captcha so its interactive popup remains accessible.
+  await nextTick()
+  await rowAction(account.id, 'quota', planId)
+}
 function edit(account: Account | null = null) {
   editingAccount.value = account
   showEditor.value = true
@@ -161,6 +179,10 @@ function manageEnable() {
 }
 function manageAction(operation: 'quota' | 'probe') {
   if (!managing.value) return
+  if (operation === 'quota') {
+    openClaimDetails(managing.value.id)
+    return
+  }
   void action(managing.value.id, operation)
   managingId.value = null
 }
@@ -415,19 +437,13 @@ async function batch(enabled: boolean) {
                   <span v-if="account.eligibility.status === 'ready' && !account.eligibility.plans.length" class="quota-sync-state">上游本次未返回可领取套餐</span>
                   <button v-for="plan in account.eligibility.plans" :key="plan.planId"
                     class="text-link small-link" :title="plan.description || plan.campaign?.body || plan.planId"
-                    :disabled="busy.has(account.id)" @click="rowAction(account.id, 'quota', plan.planId)">
-                    <Zap :size="12" />领取 {{ plan.name }}
+                    :disabled="busy.has(account.id)" @click="openClaimDetails(account.id, plan.planId)">
+                    <Zap :size="12" />{{ plan.name }} · 查看详情
                   </button>
                   <span v-if="account.eligibility.currentError" class="quota-sync-state error">已领套餐：{{ account.eligibility.currentError }}</span>
-                  <details v-if="account.eligibility.currentPlans?.length" class="quota-updated">
-                    <summary>已领套餐（{{ account.eligibility.currentPlans.length }}）</summary>
-                    <div v-for="plan in account.eligibility.currentPlans" :key="plan.userPlanId || plan.planId">
-                      {{ plan.name }} · {{ plan.status }}
-                      <span v-if="plan.effectiveAt === 0"> · 立即生效</span>
-                      <span v-else-if="plan.effectiveAt"> · {{ time(new Date(plan.effectiveAt).toISOString(), true) }} 生效</span>
-                      <span v-if="plan.endsAt"> · {{ time(new Date(plan.endsAt).toISOString(), true) }} 到期</span>
-                    </div>
-                  </details>
+                  <button class="text-link small-link" @click="openClaimDetails(account.id)">
+                    活动与已领套餐详情<span v-if="account.eligibility.currentPlans?.length">（已领 {{ account.eligibility.currentPlans.length }}）</span>
+                  </button>
                   <details v-if="account.eligibility.diagnostics" class="quota-updated">
                     <summary>查询详情 · 客户端 {{ account.eligibility.version?.reported }}</summary>
                     <div v-if="account.eligibility.version?.error">{{ account.eligibility.version.error }}</div>
@@ -476,10 +492,10 @@ async function batch(enabled: boolean) {
                 ><button
                   class="icon-button quota-button"
                   :disabled="busy.has(account.id)"
-                  :aria-label="`领取${account.name}额度`"
+                  :aria-label="`查看${account.name}套餐详情`"
                   :aria-busy="rowOps[account.id] === 'quota'"
-                  title="领取可用套餐额度"
-                  @click="rowAction(account.id, 'quota')"
+                  title="查看套餐详情后领取"
+                  @click="openClaimDetails(account.id)"
                 >
                   <LoaderCircle v-if="rowOps[account.id] === 'quota'" :size="15" class="spin" /><Zap
                     v-else
@@ -522,13 +538,13 @@ async function batch(enabled: boolean) {
       <span class="eyebrow">YOUR POOL STARTS HERE</span>
       <h2>从第一个账号开始</h2>
       <p>
-        完成一次 ZCode 登录授权，剩下的纳管、领额度和请求分配，<br
+        完成 ZCode 登录授权后，刷新资格并选择套餐领取，<br
           class="desktop-only"
-        />交给网关自动完成。
+        />网关自动管理账号与请求分配。
       </p>
       <button class="button primary" @click="startOnboard(preferred())"><Plus :size="16" />登录第一个账号</button>
       <div class="empty-steps">
-        <span><b>1</b>登录授权</span><ArrowRight :size="13" /><span><b>2</b>自动纳管领取</span
+        <span><b>1</b>登录授权</span><ArrowRight :size="13" /><span><b>2</b>查看套餐并领取</span
         ><ArrowRight :size="13" /><span><b>3</b>统一 API 调用</span>
       </div>
     </div>
@@ -569,6 +585,16 @@ async function batch(enabled: boolean) {
     </section>
   </div>
   <AccountDialog v-if="showEditor" :account="editingAccount" @close="showEditor = false" />
+  <ClaimDetailsDialog
+    v-if="detailsAccount"
+    :account="detailsAccount"
+    :initial-plan-id="detailsPlanId"
+    :refreshing="!!refreshProgress"
+    :busy="busy.has(detailsAccount.id)"
+    @close="detailsAccountId = null"
+    @refresh="refreshQualifications([detailsAccount.id])"
+    @claim="claimFromDetails"
+  />
   <OnboardDialog
     v-if="showOnboard"
     :initial-provider="onboardProvider"
@@ -596,8 +622,8 @@ async function batch(enabled: boolean) {
         :disabled="busy.has(managing.id)"
         @click="manageAction('quota')"
       >
-        <Wallet :size="19" /><strong>领取套餐额度</strong
-        ><small>领取该账号当前可领的套餐</small></button
+        <Wallet :size="19" /><strong>活动与套餐详情</strong
+        ><small>查看账号、活动时间与额度，再选择领取</small></button
       ><button
         :disabled="busy.has(managing.id) || !managing.enabled"
         @click="manageAction('probe')"

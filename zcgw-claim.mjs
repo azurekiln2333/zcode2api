@@ -31,7 +31,8 @@ export function parseClaimPlan(plan) {
     .filter((e) => e?.meter === 'model_usage' && str(e, 'unit_type', 'unitType') === 'token' && str(e, 'show_name', 'showName').trim())
     .map((e) => ({ model: str(e, 'show_name', 'showName'), grant: num(e, 'grant_units', 'grantUnits') ?? 0, period: str(e, 'period') || 'one_time' }));
   return { planId, name: str(plan, 'name').trim() || planId, description: str(plan, 'description').trim(),
-    priority: Number.isInteger(plan.priority) ? plan.priority : 0, entitlements: grants, effectiveAt: effectiveAt(plan), campaign: null };
+    priority: Number.isInteger(plan.priority) ? plan.priority : 0, entitlements: grants, effectiveAt: effectiveAt(plan),
+    startsAt: millis(num(plan, 'starts_at', 'startsAt')), endsAt: millis(num(plan, 'ends_at', 'endsAt')), campaign: null };
 }
 
 function walk(value, visit) {
@@ -70,19 +71,19 @@ export function campaignFromDelivery(delivery) {
   };
 }
 export function parseMarketingPlans(deliveries) {
-  const payloads = [], buttonIds = new Set();
+  const payloads = [], buttonIds = new Map();
   for (const delivery of deliveries) {
     const campaign = campaignFromDelivery(delivery);
     walk(delivery, (obj) => {
       const action = actionInfo(obj.action);
-      if (['claim_zcode_plan', 'claim_plan'].includes(action.kind) && action.planId) buttonIds.add(action.planId);
+      if (['claim_zcode_plan', 'claim_plan'].includes(action.kind) && action.planId && !buttonIds.has(action.planId)) buttonIds.set(action.planId, campaign);
       if (typeof obj.name === 'string' || Array.isArray(obj.entitlements)) {
         const plan = parseClaimPlan(obj);
         if (plan) payloads.push({ ...plan, campaign });
       }
     });
   }
-  for (const planId of buttonIds) if (!payloads.some((p) => p.planId === planId)) payloads.push(parseClaimPlan({ plan_id: planId }));
+  for (const [planId, campaign] of buttonIds) if (!payloads.some((p) => p.planId === planId)) payloads.push({ ...parseClaimPlan({ plan_id: planId }), campaign });
   const plans = new Map();
   for (const plan of sortPlans(payloads)) if (!plans.has(plan.planId)) plans.set(plan.planId, plan);
   return [...plans.values()];
@@ -99,8 +100,7 @@ export function mergeClaimPlans(base, extra) {
 export function parseCurrentPlans(plans) {
   return plans.map((p) => {
     const plan = parseClaimPlan(p);
-    return plan ? { ...plan, userPlanId: str(p, 'user_plan_id', 'userPlanId'), status: str(p, 'status'),
-      startsAt: millis(p.starts_at), endsAt: millis(p.ends_at) } : null;
+    return plan ? { ...plan, userPlanId: str(p, 'user_plan_id', 'userPlanId'), status: str(p, 'status') } : null;
   }).filter(Boolean).sort((a, b) => (b.endsAt || 0) - (a.endsAt || 0) || a.planId.localeCompare(b.planId));
 }
 

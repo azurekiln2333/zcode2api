@@ -18,6 +18,8 @@ test('reference plan contract handles renamed plans, campaign metadata and immed
   assert.equal(plans.length, 1);
   assert.equal(plans[0].name, payload.name);
   assert.equal(plans[0].effectiveAt, 0);
+  assert.equal(plans[0].startsAt, 1700000000000);
+  assert.equal(plans[0].endsAt, 1800000000000);
   assert.deepEqual(plans[0].entitlements.map((e) => e.model), ['Model A', 'Model B']);
   assert.deepEqual(plans[0].campaign, { campaignId: 'arbitrary-campaign', position: 'home', title: '活动文案', body: '第一行 第二行',
     startsAt: 1700000000000, endsAt: 1800000000000, buttons: [{ kind: 'claim_zcode_plan', planId: payload.plan_id }] });
@@ -30,6 +32,15 @@ test('reference plan contract handles renamed plans, campaign metadata and immed
   assert.equal(current[0].userPlanId, 'account-plan');
   assert.equal(current[0].effectiveAt, 0);
   assert.equal(current[0].startsAt, 1700000000000);
+});
+
+test('button-only marketing offers retain the activity metadata needed by the confirmation dialog', () => {
+  const [plan] = parseMarketingPlans([{ campaignId: 'campaign-id', title: '可变化的活动名称', starts_at: 1790000000,
+    description: '活动详情', buttons: [{ action: { type: 'claim_plan', planId: 'offer-button' } }] }]);
+  assert.equal(plan.planId, 'offer-button');
+  assert.equal(plan.campaign.title, '可变化的活动名称');
+  assert.equal(plan.campaign.campaignId, 'campaign-id');
+  assert.equal(plan.campaign.startsAt, 1790000000000);
 });
 
 test('challenge response headers and exhausted allocation are terminal claim failures', () => {

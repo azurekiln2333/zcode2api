@@ -59,8 +59,22 @@ export interface ClaimPlan {
   name: string
   description: string
   effectiveAt: number | null
+  startsAt?: number | null
+  endsAt?: number | null
   entitlements: Array<{ model: string; grant: number; period: string }>
-  campaign: { title: string; body: string; startsAt: number | null; endsAt: number | null } | null
+  campaign: {
+    campaignId?: string
+    position?: string
+    title: string
+    body: string
+    startsAt: number | null
+    endsAt: number | null
+  } | null
+}
+
+export interface CurrentClaimPlan extends ClaimPlan {
+  userPlanId: string
+  status: string
 }
 
 export interface ClaimResult {
@@ -87,7 +101,7 @@ interface EligibilityChannel {
 export interface Eligibility {
   status: 'ready' | 'partial' | 'error'
   plans: ClaimPlan[]
-  currentPlans?: Array<ClaimPlan & { userPlanId: string; status: string; startsAt: number | null; endsAt: number | null }>
+  currentPlans?: CurrentClaimPlan[]
   currentError?: string | null
   version?: { reported: string; latest: string | null; stale: boolean; checkedAt: string | null; error: string | null }
   diagnostics?: { preview: EligibilityChannel; marketing: EligibilityChannel; current: EligibilityChannel; elapsedMs: number }

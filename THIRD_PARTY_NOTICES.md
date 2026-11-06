@@ -1,7 +1,7 @@
 # zcode-switch
 
 The ZCode version tracking, billing headers, activation, eligibility parsing,
-request transport and claim handling are adapted from `zcode-switch`,
+request transport, claim handling and activity detail time semantics are adapted from `zcode-switch`,
 revision `295d488dea7c1f0232148ecd4000038cf860b9cf` (2026-11-07 source checkout).
 
 MIT License
