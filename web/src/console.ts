@@ -1,6 +1,7 @@
 import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
 import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
+import { visibleQuotaSources } from './quota'
 import type { Account, AccountRefresh, ClaimPlan, ClaimResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
 
 const overview = ref<Overview | null>(null)
@@ -220,7 +221,7 @@ async function refreshQualifications(ids?: string[]) {
       refreshingAccounts.value.add(id)
       try {
         const result = await refreshAccount(id)
-        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.eligibility.currentError || result.quotaSources.some((s) => s.status === 'error')) failures++
+        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.eligibility.currentError || visibleQuotaSources(result.quotaSources).some((s) => s.status === 'error')) failures++
       } catch (error) {
         failures++
         if (generation === sessionGeneration) notify(`${id}：${error instanceof Error ? error.message : '刷新失败'}`, true)

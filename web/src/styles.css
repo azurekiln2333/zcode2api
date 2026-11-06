@@ -1086,19 +1086,19 @@ button.button,
   width: 39px;
 }
 .account-table th:nth-child(2) {
-  width: 28%;
+  width: 22%;
 }
 .account-table th:nth-child(3) {
   width: 14%;
 }
 .account-table th:nth-child(4) {
-  width: 17%;
+  width: 31%;
 }
 .account-table th:nth-child(5) {
-  width: 11%;
+  width: 8%;
 }
 .account-table th:nth-child(6) {
-  width: 13%;
+  width: 8%;
 }
 .account-table th:last-child {
   width: 115px;
@@ -1350,7 +1350,7 @@ button.button,
   color: var(--muted);
   margin-top: 6px;
 }
-.quota-details { min-width: 220px; max-width: 360px; white-space: normal; }
+.quota-details { min-width: 0; width: 100%; white-space: normal; }
 .quota-source + .quota-source { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
 .quota-source-name { display: block; font-size: 12px; color: var(--primary); }
 .quota-plan { margin-top: 10px; }
@@ -1359,8 +1359,9 @@ button.button,
 .quota-item-name { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .quota-details .quota-track { max-width: none; margin-top: 4px; }
 .quota-details .quota-numbers { flex-wrap: wrap; white-space: normal; }
-.quota-details .quota-sync-state { max-width: none; overflow-wrap: anywhere; }
-.eligibility-status { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
+.quota-details .quota-sync-state,
+.quota-cell .quota-sync-state { max-width: none; overflow-wrap: anywhere; }
+.quota-details + .eligibility-status { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
 .eligibility-status .text-link { display: flex; margin-top: 6px; text-align: left; white-space: normal; }
 .overview-quota-list { max-height: 340px; overflow: auto; margin-top: 16px; }
 .overview-quota-list > details { border-top: 1px solid var(--line); padding: 10px 0; }

@@ -13,13 +13,16 @@ import {
 } from '@lucide/vue'
 import { number, compact, useConsole, accountState, time } from '../console'
 import { abbreviateCount } from '../format'
-import { summarizeQuota } from '../quota'
+import { summarizeQuota, visibleQuotaSources } from '../quota'
 import type { TokenTotals } from '../types'
 import QuotaDetails from '../components/QuotaDetails.vue'
 const emit = defineEmits<{ navigate: [page: 'accounts'] }>()
 const { overview, accounts, lastUpdated, refreshQualifications, refreshProgress } = useConsole()
 const tokenPeriod = ref<'today' | 'total'>('today')
 const credits = computed(() => summarizeQuota(accounts.value))
+const quotaAccounts = computed(() => accounts.value.filter((account) =>
+  visibleQuotaSources(account.quotaSources || []).length > 0,
+))
 const tokens = computed(() => overview.value?.stats.tokenUsage?.[tokenPeriod.value])
 const todayTokens = computed(() => overview.value?.stats.tokenUsage?.today)
 const tokenNumber = (usage: TokenTotals | null | undefined, key: keyof TokenTotals) =>
@@ -159,8 +162,8 @@ const states = computed(() => [
       <button class="text-link" :disabled="!!refreshProgress || !accounts.length" @click="refreshQualifications()">
         {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '刷新资格与额度' }}
       </button>
-      <div class="overview-quota-list">
-        <details v-for="account in accounts" :key="account.id">
+      <div v-if="quotaAccounts.length" class="overview-quota-list">
+        <details v-for="account in quotaAccounts" :key="account.id">
           <summary>{{ account.name }}</summary>
           <QuotaDetails :sources="account.quotaSources || []" />
         </details>

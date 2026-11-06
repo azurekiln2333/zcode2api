@@ -1,22 +1,23 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { number, time } from '../console'
+import { visibleQuotaSources } from '../quota'
 import type { QuotaSource } from '../types'
-defineProps<{ sources: QuotaSource[] }>()
+const props = defineProps<{ sources: QuotaSource[] }>()
+const visibleSources = computed(() => visibleQuotaSources(props.sources))
 </script>
 
 <template>
-  <div class="quota-details">
-    <section v-for="source in sources" :key="source.id" class="quota-source">
+  <div v-if="visibleSources.length" class="quota-details">
+    <section v-for="source in visibleSources" :key="source.id" class="quota-source">
       <strong class="quota-source-name">{{ source.name }}</strong>
       <span v-if="source.status === 'pending'" class="quota-sync-state">等待查询，可点击刷新资格</span>
       <span v-if="source.error" class="quota-sync-state" :class="{ error: source.status === 'error' }">
         {{ source.error }}{{ source.syncedAt ? ' · 以下为上次成功数据' : '' }}
       </span>
-      <span v-if="source.status === 'ready' && !source.plans.length" class="quota-sync-state">未返回生效套餐</span>
       <div v-for="plan in source.plans" :key="plan.id" class="quota-plan">
         <div class="quota-plan-name" :title="plan.id">{{ plan.name }}</div>
         <span v-if="plan.endsAt" class="quota-updated">到期 {{ time(plan.endsAt, true) }}</span>
-        <span v-if="!plan.items.length" class="quota-sync-state">未返回额度明细</span>
         <div v-for="item in plan.items" :key="item.id" class="quota-item">
           <span class="quota-item-name">{{ item.name }}</span>
           <div class="quota-numbers">
