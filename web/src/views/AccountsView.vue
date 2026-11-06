@@ -404,6 +404,8 @@ async function batch(enabled: boolean) {
                 </button>
                 <span v-if="!account.eligibility" class="quota-sync-state">领取资格尚未查询</span>
                 <template v-else>
+                  <span v-if="account.eligibility.activation?.error" class="quota-sync-state error">{{ account.eligibility.activation.error }}</span>
+                  <span v-else-if="account.eligibility.activation?.status === 'ready'" class="quota-updated">资格激活上报已完成</span>
                   <span v-if="account.eligibility.error" class="quota-sync-state error">{{ account.eligibility.error }}</span>
                   <span v-if="account.eligibility.status === 'ready' && !account.eligibility.plans.length" class="quota-sync-state">暂无可领取套餐</span>
                   <button v-for="plan in account.eligibility.plans" :key="plan.planId"

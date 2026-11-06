@@ -17,6 +17,9 @@ test('authenticated console refresh preserves distinct sources and partial failu
   const credentials = [
     { label: 'disabled-account', jwt: jwt('disabled'), disabled: true, codingPlanApiKey: 'test-coding-key', realm: 'intl' },
     { label: 'unconfigured', jwt: jwt('unconfigured'), realm: 'cn' },
+    { label: 'activation-account', jwt: jwt('activation-account'), disabled: true, realm: 'cn', activationUserId: 'authorized-profile' },
+    { label: 'activation-failure', jwt: jwt('activation-failure'), realm: 'cn', activationUserId: 'failed-profile' },
+    { label: 'profile-account', jwt: jwt('profile-account'), realm: 'cn', zaiAccessToken: 'test-profile-token' },
   ];
   await writeFile(path.join(dataDir, 'accounts.json'), JSON.stringify(credentials));
   let failBalance = false;
@@ -30,6 +33,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
   let claims = 0;
   let claimBody;
   let balanceCalls = 0;
+  const activationEvents = [];
   const requests = [];
   const upstream = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -42,6 +46,25 @@ test('authenticated console refresh preserves distinct sources and partial failu
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ code, data }));
     };
+    if (url.pathname.endsWith('/oauth/cli/init')) {
+      return send({ flow_id: 'test-login', authorize_url: 'https://example.invalid/login?state=test-login', poll_interval_sec: 1 });
+    }
+    if (url.pathname.endsWith('/oauth/cli/poll/test-login')) {
+      return send({ status: 'ready', token: jwt('unconfigured'), user: { user_id: 'reauthed-profile', name: 'Test user' } });
+    }
+    if (url.pathname.endsWith('/customer/getCustomerInfo')) {
+      assert.equal(req.headers.authorization, 'Bearer test-profile-token');
+      return send({ customerNumber: 'customer-profile-id', phoneNumber: '138****0000', countryCode: '+86' }, 200);
+    }
+    if (url.pathname.endsWith('/event/report')) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks));
+      activationEvents.push({ body, headers: req.headers, requestIndex: requests.length - 1 });
+      await delay(20);
+      if (body.user_id === 'failed-profile') return send({ message: 'secret-upstream-detail' }, 3012, 403);
+      return reply({ body: { code: 0 } });
+    }
     if (url.pathname.endsWith('/billing/balance')) {
       balanceCalls++;
       if (balanceReply) return reply(balanceReply);
@@ -65,6 +88,10 @@ test('authenticated console refresh preserves distinct sources and partial failu
       ] }, 200);
     }
     if (url.pathname.endsWith('/billing/preview')) {
+      if (req.headers.authorization === `Bearer ${jwt('activation-account')}`) {
+        const activated = activationEvents.filter((e) => e.body.user_id === 'authorized-profile').length === 2;
+        return send({ plans: activated ? [{ plan_id: 'activated-offer', name: 'Activated offer' }] : [] });
+      }
       if (previewReply) return reply(previewReply);
       if (failPreview) return send(null, 1006, 401);
       return send({ plans: [{ plan_id: 'gift', name: '注册礼包', priority: 10, entitlements: [] }] });
@@ -129,8 +156,9 @@ test('authenticated console refresh preserves distinct sources and partial failu
     return { status: r.status, body: await r.json() };
   };
   // The initial internal refresh must work despite PANEL_KEY.
-  for (let i = 0; i < 100 && balanceCalls < 2; i++) await delay(40);
-  assert.ok(balanceCalls >= 2, 'background refresh bypasses HTTP session boundary');
+  for (let i = 0; i < 100 && balanceCalls < credentials.length; i++) await delay(40);
+  assert.ok(balanceCalls >= credentials.length, 'background refresh bypasses HTTP session boundary');
+  assert.equal(activationEvents.length, 0, 'background refresh never reports activation events');
   let result = (await api('/api/accounts/disabled-account/refresh', 'POST', {})).body;
   assert.equal(result.quotaSources.length, 2);
   assert.deepEqual(result.quotaSources.map((s) => s.status), ['ready', 'ready']);
@@ -293,5 +321,97 @@ test('authenticated console refresh preserves distinct sources and partial failu
     for (const key of ['authorization', 'x-device-mid', 'x-zcode-app-version', 'x-platform', 'x-os-category', 'x-client-language', 'x-client-timezone', 'x-title', 'user-agent']) {
       assert.ok(req.headers[key], `missing ${key}`);
     }
+  });
+
+  await t.test('manual refresh activates the authorized identity before discovery and deduplicates repeated requests', async () => {
+    previewReply = marketingReply = undefined;
+    const before = activationEvents.length;
+    await api('/claimable');
+    await api('/api/overview');
+    assert.equal(activationEvents.length, before, 'read-only queries never activate an account');
+    const requestStart = requests.length;
+    const claimCount = claims;
+    const [first, parallel] = await Promise.all([
+      api('/api/accounts/activation-account/refresh', 'POST', {}),
+      api('/api/accounts/activation-account/refresh', 'POST', {}),
+    ]);
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body, parallel.body);
+    const state = first.body.eligibility;
+    assert.equal(state.activation.status, 'ready');
+    assert.equal(state.activation.error, null);
+    assert.ok(Date.parse(state.activation.retryAt) > Date.parse(state.activation.checkedAt));
+    assert.ok(state.plans.some((p) => p.planId === 'activated-offer'));
+    const events = activationEvents.slice(before);
+    assert.deepEqual(events.map((e) => e.body.element_name), ['app_launch', 'app_daily_active']);
+    assert.notEqual(events[0].body.event_id, events[1].body.event_id);
+    const previewIndex = requests.findIndex((r, i) => i >= requestStart && r.path.endsWith('/billing/preview'));
+    assert.ok(previewIndex > events[1].requestIndex, 'discovery must follow both activation events');
+    const preview = requests[previewIndex];
+    for (const event of events) {
+      assert.equal(event.body.user_id, 'authorized-profile', 'use saved OAuth user info rather than the gateway JWT ID');
+      assert.equal(event.body.device_mid, preview.headers['x-device-mid']);
+      assert.equal(event.body.app_version, preview.headers['x-zcode-app-version']);
+      assert.equal(event.body.device_os_category, preview.headers['x-os-category']);
+      assert.equal(event.body.client_timezone, preview.headers['x-client-timezone']);
+      assert.equal(event.headers.authorization, undefined, 'telemetry contains no login tokens');
+    }
+    const again = (await api('/api/accounts/activation-account/refresh', 'POST', {})).body;
+    assert.deepEqual(again.eligibility.activation, state.activation);
+    assert.equal(activationEvents.length, before + 2, 'activation is limited to once per minute');
+    assert.equal(claims, claimCount, 'refresh must not claim an offer');
+    const snapshot = (await api('/api/overview')).body.accounts.find((a) => a.id === 'activation-account');
+    assert.equal(snapshot.enabled, false, 'disabled accounts can activate without rejoining scheduling');
+    assert.equal(snapshot.eligibility.activation.status, 'ready');
+  });
+
+  await t.test('activation failure is visible and rate limited while independent discovery continues', async () => {
+    const before = activationEvents.length;
+    const current = (await api('/api/accounts/activation-failure/refresh', 'POST', {})).body;
+    assert.equal(current.eligibility.status, 'ready');
+    assert.ok(current.eligibility.plans.length > 0);
+    assert.equal(current.eligibility.activation.status, 'error');
+    assert.match(current.eligibility.activation.error, /403.*3012/);
+    assert.ok(!JSON.stringify(current).includes('secret-upstream-detail'));
+    assert.equal(activationEvents.length, before + 1, 'stop after the first rejected event');
+    await api('/api/accounts/activation-failure/refresh', 'POST', {});
+    assert.equal(activationEvents.length, before + 1, 'failed activation attempts also respect the cooldown');
+  });
+
+  await t.test('missing OAuth identity is explicit and existing authorized profiles are retained privately', async () => {
+    const before = activationEvents.length;
+    const missing = (await api('/api/accounts/unconfigured/refresh', 'POST', {})).body;
+    assert.equal(missing.eligibility.status, 'ready');
+    assert.equal(missing.eligibility.activation.status, 'unavailable');
+    assert.match(missing.eligibility.activation.error, /重新登录/);
+    assert.equal(activationEvents.length, before, 'never invent an activation user ID from the gateway JWT');
+    const profile = (await api('/api/accounts/profile-account/refresh', 'POST', {})).body;
+    assert.equal(profile.eligibility.activation.status, 'ready');
+    assert.deepEqual(activationEvents.slice(before).map((e) => e.body.user_id), ['customer-profile-id', 'customer-profile-id']);
+    const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+    assert.equal(saved.find((a) => a.label === 'profile-account').activationUserId, 'customer-profile-id');
+    const overview = (await api('/api/overview')).body;
+    assert.ok(!JSON.stringify(overview).includes('customer-profile-id'));
+    assert.ok(!JSON.stringify(overview).includes('test-profile-token'));
+  });
+
+  await t.test('re-login persists the authorized profile and bypasses an unavailable activation cache', async () => {
+    const before = activationEvents.length;
+    const claimCount = claims;
+    const started = await api('/onboard/start', 'POST', { provider: 'bigmodel' });
+    assert.equal(started.status, 200);
+    const loggedIn = await api(`/onboard/poll/${started.body.flowId}`);
+    assert.equal(loggedIn.status, 200);
+    assert.equal(loggedIn.body.status, 'ready');
+    assert.equal(loggedIn.body.added, false);
+    assert.equal(loggedIn.body.label, 'unconfigured');
+    assert.equal(activationEvents.length, before, 'login alone does not trigger activation');
+    const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+    assert.equal(saved.find((a) => a.label === 'unconfigured').activationUserId, 'reauthed-profile');
+    const refreshed = (await api('/api/accounts/unconfigured/refresh', 'POST', {})).body;
+    assert.equal(refreshed.eligibility.activation.status, 'ready');
+    assert.deepEqual(activationEvents.slice(before).map((e) => e.body.user_id), ['reauthed-profile', 'reauthed-profile']);
+    assert.equal(claims, claimCount);
+    assert.ok(!JSON.stringify((await api('/api/overview')).body).includes('reauthed-profile'));
   });
 });

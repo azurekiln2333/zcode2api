@@ -216,7 +216,7 @@ async function refreshQualifications(ids?: string[]) {
       refreshingAccounts.value.add(id)
       try {
         const result = await refreshAccount(id)
-        if (result.eligibility.status !== 'ready' || result.quotaSources.some((s) => s.status === 'error')) failures++
+        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.quotaSources.some((s) => s.status === 'error')) failures++
       } catch (error) {
         failures++
         if (generation === sessionGeneration) notify(`${id}：${error instanceof Error ? error.message : '刷新失败'}`, true)
@@ -234,7 +234,7 @@ async function refreshQualifications(ids?: string[]) {
     // Wait for any earlier poll before requesting the updated snapshots.
     if (refreshPromise) await refreshPromise
     await refresh()
-    notify(`已刷新 ${targets.length} 个账号${failures ? `，${failures} 个存在查询失败，请查看明细` : '的资格和额度'}`, failures > 0)
+    notify(`已刷新 ${targets.length} 个账号${failures ? `，${failures} 个需要查看资格或额度提示` : '的资格和额度'}`, failures > 0)
   } finally {
     if (generation === sessionGeneration) refreshProgress.value = null
   }

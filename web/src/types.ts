@@ -59,6 +59,12 @@ export interface Eligibility {
   plans: Array<{ planId: string; name: string; description: string }>
   checkedAt: string
   error: string | null
+  activation?: {
+    status: 'ready' | 'error' | 'unavailable'
+    checkedAt: string
+    retryAt: string
+    error: string | null
+  } | null
 }
 
 export interface AccountRefresh {

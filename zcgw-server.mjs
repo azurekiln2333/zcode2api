@@ -141,7 +141,7 @@ async function fetchCustomerInfo(accessToken) {
     });
     const j = await safeJson(r);
     // 这个接口的成功码是 200（不是 0），且外层有 success 字段
-    if (j.code !== 200 || !j.data) return null;
+    if (!r.ok || j?.success === false || j?.code !== 200 || !j.data) return null;
     return j.data;
   } catch {
     return null;
@@ -159,6 +159,15 @@ function realmFromCustomer(d) {
   return 'unknown';
 }
 
+/** Use an authorized profile ID; the gateway JWT may identify a different namespace. */
+function profileUserId(profile) {
+  for (const key of ['user_id', 'customerNumber', 'sub', 'id']) {
+    const value = profile?.[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
 /** 把一次 customerInfo 结果合并回 accounts.json 的记录；有变更返回 true */
 function mergeCustomerInfo(rec, d) {
   if (!d) return false;
@@ -167,6 +176,7 @@ function mergeCustomerInfo(rec, d) {
   const phone = String(d.phoneNumber || '').trim();
   const realm = realmFromCustomer(d);
   const nick = String(d.nickName || d.customerName || '').trim();
+  const activationUserId = profileUserId(d);
 
   // 手机号账号的 email 是空的：把历史的 xxx@phone.local 占位清掉，改用真实打码手机号
   if (phone && rec.phone !== phone) { rec.phone = phone; changed = true; }
@@ -175,6 +185,7 @@ function mergeCustomerInfo(rec, d) {
   if (realm !== 'unknown' && rec.realm !== realm) { rec.realm = realm; changed = true; }
   if (d.countryCode && rec.countryCode !== d.countryCode) { rec.countryCode = d.countryCode; changed = true; }
   if (nick && !rec.name) { rec.name = nick; changed = true; }
+  if (activationUserId && !rec.activationUserId) { rec.activationUserId = activationUserId; changed = true; }
   return changed;
 }
 
@@ -186,7 +197,7 @@ function localAccessToken() {
     const at = decryptCredential(raw['oauth:zai:access_token'] ?? '').trim();
     const jwt = decryptCredential(raw['zcodejwttoken'] ?? '').trim();
     if (!at.startsWith('eyJ') || !jwt.startsWith('eyJ')) return null;
-    return { accessToken: at, uid: userIdFromJwt(jwt) };
+    return { accessToken: at, uid: userIdFromJwt(jwt), activationUserId: localActivationUserId() };
   } catch {
     return null;
   }
@@ -200,10 +211,11 @@ function seedLocalAccessToken() {
     const arr = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
     let n = 0;
     for (const a of arr) {
-      if (userIdFromJwt(a.jwt) === local.uid && !a.zaiAccessToken) {
-        a.zaiAccessToken = local.accessToken;
-        n += 1;
-      }
+      if (userIdFromJwt(a.jwt) !== local.uid) continue;
+      let changed = false;
+      if (!a.zaiAccessToken) { a.zaiAccessToken = local.accessToken; changed = true; }
+      if (!a.activationUserId && local.activationUserId) { a.activationUserId = local.activationUserId; changed = true; }
+      if (changed) n += 1;
     }
     if (n) fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
     return n;
@@ -274,6 +286,17 @@ function localJwt() {
   }
 }
 
+function localActivationUserId() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(zcodeDir(), 'credentials.json'), 'utf8'));
+    const provider = decryptCredential(raw['oauth:active_provider'] ?? '').trim() || 'zai';
+    const info = JSON.parse(decryptCredential(raw[`oauth:${provider}:user_info`] ?? '{}'));
+    return profileUserId(info);
+  } catch {
+    return null;
+  }
+}
+
 function loadAccounts() {
   // 优先用 accounts.json；没有就回退到本地 ZCode 客户端凭证（单账号模式）
   if (fs.existsSync(ACC_FILE)) return readAccountFile();
@@ -294,6 +317,7 @@ function loadAccounts() {
       jwt,
       uid,
       local: true, // 每次请求重读客户端凭证，客户端刷新 token 后自动跟上
+      activationUserId: localActivationUserId(),
       deviceId: deviceIdFor(uid),
       sessionId: sessionIdFor(uid),
       cooldownUntil: 0,
@@ -337,6 +361,7 @@ function readAccountFile() {
         identity: displayIdentity({ email: a.email, phone: a.phone, realm }),
         hasAccessToken: !!a.zaiAccessToken,
         zaiAccessToken: a.zaiAccessToken || null,
+        activationUserId: typeof a.activationUserId === 'string' ? a.activationUserId.trim() || null : null,
         codingPlanApiKey: a.codingPlanApiKey || null,
         codingPlanProvider: a.codingPlanProvider || (realm === 'cn' ? 'bigmodel' : 'zai'),
         weight: Number(a.weight) || 1,
@@ -362,12 +387,14 @@ function persistAccount(jwt, label, extra = {}) {
   const email = extra.email || null;
   const realm = extra.realm || detectRealm(jwt, null, email);
   const accessToken = extra.accessToken || null;
+  const activationUserId = typeof extra.activationUserId === 'string' ? extra.activationUserId.trim() : '';
   const existing = arr.find((a) => userIdFromJwt(a.jwt) === uid);
   if (existing) {
     if (email) existing.email = email;
     if (extra.name) existing.name = extra.name;
     if (extra.phone) existing.phone = extra.phone;
     if (accessToken) existing.zaiAccessToken = accessToken;
+    if (activationUserId) existing.activationUserId = activationUserId;
     if (realm !== 'unknown') existing.realm = realm;
     fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
     return { added: false, label: existing.label };
@@ -379,6 +406,7 @@ function persistAccount(jwt, label, extra = {}) {
     name: extra.name || null,
     realm,
     ...(accessToken ? { zaiAccessToken: accessToken } : {}),
+    ...(activationUserId ? { activationUserId } : {}),
   });
   fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
   return { added: true, label };
@@ -564,6 +592,7 @@ function stickyUnbind(key) {
 let quotaCache = new Map(); // Billing totals for scheduling only; UI uses separate sources.
 const quotaSources = new Map();
 const eligibilityCache = new Map();
+const activationCache = new Map();
 const accountRefreshes = new Map();
 function setQuotaCache(list) {
   for (const a of list) {
@@ -1614,6 +1643,75 @@ async function marketingClaimablePlans(acc) {
   return [...plans.values()];
 }
 
+/** Manual refresh mirrors zcode-switch's activation sequence, without submitting a claim. */
+async function activateEligibility(acc) {
+  const key = `${acc.label}:activation`;
+  if (accountRefreshes.has(key)) return accountRefreshes.get(key);
+  if (acc.local) acc.activationUserId = localActivationUserId();
+  const identity = acc.activationUserId || null;
+  const previous = activationCache.get(acc.label);
+  if (previous?.identity === identity && Date.parse(previous.state.retryAt) > Date.now()) return previous.state;
+  const run = (async () => {
+    const checkedAt = new Date().toISOString();
+    const retryAt = new Date(Date.now() + 60_000).toISOString();
+    let state;
+    if (!identity) {
+      state = { status: 'unavailable', checkedAt, retryAt, error: '缺少授权用户信息，未执行资格激活；请重新登录该账号，现有套餐查询仍可使用' };
+    } else {
+      try {
+        const headers = upstreamHeaders(acc);
+        for (const element of ['app_launch', 'app_daily_active']) {
+          const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/event/report`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            signal: AbortSignal.timeout(10000),
+            body: JSON.stringify({
+              event_id: crypto.randomUUID(), element_name: element,
+              event_region: 'app', event_type: 'view', event_text: '', event_extra_detail: {},
+              user_id: identity, device_mid: acc.deviceId,
+              app_version: APP_VERSION, client_timezone: headers['x-client-timezone'],
+              client_language: headers['x-client-language'],
+              device_os_category: headers['x-os-category'], device_os_version: headers['x-os-version'],
+              screen_resolution: '2560x1440', mac_id: '', marketing_params: '{}',
+            }),
+          });
+          const j = await safeJson(r);
+          if (!r.ok || !j || j.__error || j.success === false || ![0, '0'].includes(j.code)) {
+            const code = j?.code ?? j?.provider_code;
+            const codeText = code != null && Number.isFinite(Number(code)) ? Number(code) : '未知';
+            throw new Error(`资格激活失败（HTTP ${r.status}，业务码 ${codeText}）`);
+          }
+        }
+        state = { status: 'ready', checkedAt, retryAt, error: null };
+      } catch (e) {
+        state = { status: 'error', checkedAt, retryAt, error: e.message.startsWith('资格激活失败') ? e.message : '资格激活请求失败或超时，已继续查询套餐' };
+      }
+    }
+    activationCache.set(acc.label, { identity, state });
+    return state;
+  })();
+  accountRefreshes.set(key, run);
+  try { return await run; } finally { accountRefreshes.delete(key); }
+}
+
+async function refreshAccountEligibility(acc) {
+  const key = `${acc.label}:manual-refresh`;
+  if (accountRefreshes.has(key)) return accountRefreshes.get(key);
+  const run = (async () => {
+    const [sources, eligibility] = await Promise.all([
+      refreshQuotaAccount(acc),
+      (async () => {
+        await activateEligibility(acc);
+        // A read-only lookup started before activation must not supply this result.
+        await accountRefreshes.get(`${acc.label}:eligibility`);
+        return refreshEligibility(acc);
+      })(),
+    ]);
+    return { quotaSources: sources, eligibility };
+  })();
+  accountRefreshes.set(key, run);
+  try { return await run; } finally { accountRefreshes.delete(key); }
+}
+
 async function refreshEligibility(acc) {
   const key = `${acc.label}:eligibility`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
@@ -1635,6 +1733,7 @@ async function refreshEligibility(acc) {
       status: errors.length === 2 ? 'error' : errors.length ? 'partial' : 'ready',
       plans: [...plans.values()].sort((a, b) => b.priority - a.priority || a.planId.localeCompare(b.planId)),
       checkedAt: new Date().toISOString(), error: errors.join('；') || null,
+      activation: activationCache.get(acc.label)?.state || null,
     };
     eligibilityCache.set(acc.label, state);
     return state;
@@ -1887,7 +1986,7 @@ async function handleAccountAdd(req, res) {
   const nick = String(customer?.nickName || customer?.customerName || body.name || '').trim() || null;
 
   const label = body.label || (nick ? `${nick}-${uid.slice(0, 8)}` : `acc-${uid.slice(0, 8)}`);
-  const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken });
+  const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken, activationUserId: profileUserId(customer) });
   accounts = readAccountFile();
   const acc = accounts.find((a) => a.uid === uid);
 
@@ -1909,6 +2008,7 @@ async function handleAccountAdd(req, res) {
         acc.email = c.email || acc.email;
         acc.phone = c.phoneNumber || acc.phone;
         acc.name = c.nickName || c.customerName || acc.name;
+        acc.activationUserId ||= profileUserId(c);
         acc.identity = displayIdentity(acc);
         const r2 = realmFromCustomer(c);
         if (r2 !== 'unknown') acc.realm = r2;
@@ -2034,7 +2134,8 @@ async function pollOnboardFlow(flowId, flow) {
   const nick = String(customer?.nickName || customer?.customerName || user.name || '').trim() || null;
   const label = nick ? `${nick}-${uid.slice(0, 8)}` : uid.slice(0, 8);
 
-  const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken });
+  const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken,
+    activationUserId: profileUserId(user) || profileUserId(customer) });
   pendingFlows.delete(flowId);
   writeFlows(pendingFlows);
   log(
@@ -2784,8 +2885,7 @@ async function handleConsoleApi(req, res, url) {
     if (sub === 'refresh' && req.method === 'POST') {
       const acc = accounts.find((a) => a.label === id);
       if (!acc) return sendJson(res, 404, { error: '找不到账号' });
-      const [sources, eligibility] = await Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]);
-      return sendJson(res, 200, { quotaSources: sources, eligibility });
+      return sendJson(res, 200, await refreshAccountEligibility(acc));
     }
     if (sub === 'selftest' && req.method === 'POST') {
       const acc = accounts.find((a) => a.label === id);
