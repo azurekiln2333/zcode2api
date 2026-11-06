@@ -18,6 +18,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { normalizeBilling, normalizeCoding } from './zcgw-quota.mjs';
 import { createVersionManager } from './zcgw-version.mjs';
+import { createClaimAutomation } from './zcgw-auto-claim.mjs';
+import { createCaptchaBrowser } from './zcgw-captcha-browser.mjs';
 import { zcodeRequest, responseJson } from './zcgw-upstream.mjs';
 import { billingHeaders, parseClaimPlan, parseMarketingPlans, mergeClaimPlans, parseCurrentPlans, effectiveAt, claimFailure } from './zcgw-claim.mjs';
 import { metadataUserId, sessionIdFor, requestId, userIdFromJwt, deviceIdFor } from './zcgw-fingerprint.mjs';
@@ -1756,15 +1758,21 @@ async function refreshEligibility(acc, version) {
 // The reference validates the chosen offer before opening captcha and consumes it once.
 const pendingClaims = new Map();
 const claimsInFlight = new Set();
+const preparingClaims = new Set();
+const automatedClaimAccounts = new Set();
 const claimIdentity = (acc) => crypto.createHash('sha256').update(`${acc.jwt}:${acc.deviceId}`).digest('hex');
-async function prepareClaim(acc, planId) {
-  const state = await refreshEligibility(acc);
-  const plan = planId ? state.plans.find((p) => p.planId === planId) : state.plans[0];
-  if (!plan) throw new Error(state.error || (planId ? '该套餐已不在可领取列表，请刷新资格后重试' : '暂无可领取套餐'));
-  const prepared = { preparationId: crypto.randomUUID(), plan, version: state.version.reported,
-    identity: claimIdentity(acc), expiresAt: Date.now() + 10 * 60_000 };
-  pendingClaims.set(acc.label, prepared);
-  return prepared;
+async function prepareClaim(acc, planId, automated = false) {
+  if ((!automated && automatedClaimAccounts.has(acc.label)) || preparingClaims.has(acc.label)) throw new Error('该账号正在准备领取，请等待本次结果');
+  preparingClaims.add(acc.label);
+  try {
+    const state = await refreshEligibility(acc);
+    const plan = planId ? state.plans.find((p) => p.planId === planId) : state.plans[0];
+    if (!plan) throw new Error(state.error || (planId ? '该套餐已不在可领取列表，请刷新资格后重试' : '暂无可领取套餐'));
+    const prepared = { preparationId: crypto.randomUUID(), plan, version: state.version.reported,
+      identity: claimIdentity(acc), expiresAt: Date.now() + 10 * 60_000 };
+    pendingClaims.set(acc.label, prepared);
+    return prepared;
+  } finally { preparingClaims.delete(acc.label); }
 }
 
 let captchaConfigCache = { ts: 0, cfg: null };
@@ -1789,8 +1797,9 @@ async function captchaConfig() {
 }
 
 /** Exactly one selected plan per captcha; every business failure is terminal. */
-async function claimFor(acc, planId, captchaParam, captchaRegion, preparationId) {
+async function claimFor(acc, planId, captchaParam, captchaRegion, preparationId, automated = false) {
   if (!captchaParam) return { ok: false, code: 'captcha_required', msg: '需要人机验证：请从面板发起领取' };
+  if (!automated && automatedClaimAccounts.has(acc.label)) return { ok: false, code: 'claim_pending', msg: '该账号正在自动领取，请等待本次结果' };
   if (claimsInFlight.has(acc.label)) return { ok: false, code: 'claim_pending', msg: '该账号正在领取，请等待本次结果' };
   claimsInFlight.add(acc.label);
   try {
@@ -1805,15 +1814,19 @@ async function claimFor(acc, planId, captchaParam, captchaRegion, preparationId)
     } else pending = await prepareClaim(acc, planId);
     pendingClaims.delete(acc.label);
     const pid = pending.plan.planId;
-    const response = await zcodeRequest(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/claim`, {
+    let response;
+    try { response = await zcodeRequest(`${UPSTREAM_ORIGIN}/api/v1/zcode-plan/billing/claim`, {
       method: 'POST', headers: { ...accountBillingHeaders(acc, pending.version),
         'x-aliyun-captcha-verify-param': captchaParam,
         ...(captchaRegion ? { 'x-aliyun-captcha-verify-region': captchaRegion } : {}),
       }, body: JSON.stringify({ plan_id: pid }), timeoutMs: CLAIM_TIMEOUT_MS, retryTransport: false,
-    });
+    }); } catch {
+      return { ok: false, unknown: true, code: 'claim_unknown', msg: '提交结果未知，请刷新套餐并人工确认；不会自动重发' };
+    }
     const body = responseJson(response);
     const code = body?.code != null && Number.isFinite(Number(body.code)) ? Number(body.code) : -1;
     log(`[${acc.label}] claim ${pid} -> HTTP ${response.status} code ${code}`);
+    if (response.status >= 500 || code === -1) return { ...claimFailure(code, response, body), unknown: true };
     if (!response.ok || ![0, '0'].includes(body?.code) || body?.success === false) return claimFailure(code, response, body);
     const millis = (v) => Number.isFinite(v) ? v * 1000 : null;
     return { ok: true, claimed: pid, claimedList: [pid], planName: pending.plan.name,
@@ -1821,6 +1834,25 @@ async function claimFor(acc, planId, captchaParam, captchaRegion, preparationId)
       effectiveAt: effectiveAt(body?.data?.plan), serverTime: millis(body?.data?.server_time) };
   } finally { claimsInFlight.delete(acc.label); }
 }
+
+const automaticCaptcha = createCaptchaBrowser();
+const claimAutomation = createClaimAutomation({
+  dataDir: DATA_DIR, getAccounts: () => accounts,
+  reserve: (acc) => {
+    if (claimsInFlight.has(acc.label) || preparingClaims.has(acc.label) || onboardRefreshes.has(acc.label)
+      || (pendingClaims.get(acc.label)?.expiresAt || 0) > Date.now()) return false;
+    automatedClaimAccounts.add(acc.label);
+    return true;
+  },
+  release: (acc) => { automatedClaimAccounts.delete(acc.label); pendingClaims.delete(acc.label); },
+  refreshAccount: refreshAccountEligibility,
+  prepare: (acc, planId) => prepareClaim(acc, planId, true),
+  verify: async () => automaticCaptcha.verify(await captchaConfig()),
+  submit: (acc, prepared, proof) => claimFor(acc, prepared.plan.planId, proof.param, proof.region, prepared.preparationId, true),
+  afterClaim: (acc) => Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]),
+  closeVerifier: () => automaticCaptcha.close(),
+  reportError: () => log('定时领取任务异常，请检查数据目录权限和浏览器运行环境'),
+});
 
 /** Legacy endpoint shares the same eligibility result as the console. */
 async function handleClaimable(req, res) {
@@ -2746,7 +2778,7 @@ function buildOverview() {
     weekendGrab: false,
     limits: POOL_LIMITS,
   };
-  return { accounts: mapped, settings, hourly, stats };
+  return { accounts: mapped, settings, hourly, stats, claimAutomation: claimAutomation.snapshot() };
 }
 
 async function handleConsoleApi(req, res, url) {
@@ -2815,6 +2847,18 @@ async function handleConsoleApi(req, res, url) {
   if (req.method === 'GET' && p === '/api/captcha/config') {
     return sendJson(res, 200, await captchaConfig());
   }
+  if (p === '/api/claim-automation' && req.method === 'GET') return sendJson(res, 200, claimAutomation.snapshot());
+  if (p === '/api/claim-automation' && req.method === 'PATCH') {
+    try {
+      const body = JSON.parse((await readBody(req)).toString('utf8'));
+      return sendJson(res, 200, claimAutomation.configure(body));
+    } catch (error) { return sendJson(res, 400, { error: error.message }); }
+  }
+  if (p === '/api/claim-automation/run' && req.method === 'POST') {
+    try { return sendJson(res, 202, claimAutomation.start()); }
+    catch (error) { return sendJson(res, 409, { error: error.message }); }
+  }
+  if (p === '/api/claim-automation/cancel' && req.method === 'POST') return sendJson(res, 200, claimAutomation.cancel());
   // GET /api/models
   if (req.method === 'GET' && p === '/api/models') {
     const models = [
@@ -3144,8 +3188,11 @@ server.listen(PORT, HOST, () => {
   setInterval(refreshQuotaWeights, 10 * 60_000); // 每 10 分钟刷一次权重缓存
   setInterval(savePoolState, 60_000); // 每分钟落盘一次调度状态
 
-  // Claims require a fresh interactive captcha for a selected account and plan.
-  // Do not run the obsolete background candidate loop without a captcha.
+  const claimTick = () => {
+    try { claimAutomation.tick(); } catch { log('定时领取任务启动失败，请检查 data/auto-claim.json'); }
+  };
+  setTimeout(claimTick, 1000).unref();
+  setInterval(claimTick, 30000).unref();
 
   // 启动后自动补齐身份：先吃本地客户端的 access_token，再拿官方客户档案反查邮箱/手机号
   setTimeout(async () => {

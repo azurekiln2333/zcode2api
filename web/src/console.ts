@@ -2,7 +2,7 @@ import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
 import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
 import { visibleQuotaSources } from './quota'
-import type { Account, AccountRefresh, ClaimPlan, ClaimResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings, SelfTestJob } from './types'
+import type { Account, AccountRefresh, ClaimPlan, ClaimResult, ClaimTaskResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings, SelfTestJob } from './types'
 
 const overview = ref<Overview | null>(null)
 const logs = ref<LogEntry[]>([])
@@ -20,6 +20,7 @@ const lastUpdated = ref<Date | null>(null)
 const busy = ref(new Set<string>())
 const refreshingAccounts = ref(new Set<string>())
 const refreshProgress = ref<{ done: number; total: number } | null>(null)
+const batchClaim = ref<{ running: boolean; cancelled: boolean; done: number; total: number; accountName: string; results: ClaimTaskResult[] } | null>(null)
 const toasts = ref<{ id: number; text: string; error: boolean; diagnostics?: ApiDiagnostics }[]>([])
 const registration = ref<{ account: Account; token: string } | null>(null)
 let notificationId = 0
@@ -32,6 +33,8 @@ let sessionGeneration = 0
 function reset() {
   sessionGeneration++
   cancelClaim()
+  batchClaim.value = null
+  activeClaimAccount = null
   overview.value = null
   logs.value = []
   registration.value = null
@@ -50,6 +53,7 @@ function reset() {
 
 function cancelClaim() {
   claimGeneration++
+  if (batchClaim.value?.running) batchClaim.value.cancelled = true
   cancelCaptcha()
 }
 
@@ -148,7 +152,7 @@ async function refreshLogs(channel: LogChannel = 'requests', query = logQueries[
  */
 async function action(id: string, operation: 'probe' | 'quota', planId?: string) {
   if (busy.value.has(id)) return
-  if (operation === 'quota' && activeClaimAccount !== null) {
+  if (operation === 'quota' && (activeClaimAccount !== null || batchClaim.value?.running)) {
     notify('请先完成或取消当前人机验证', true)
     return
   }
@@ -209,7 +213,88 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
     )
   } finally {
     if (session === sessionGeneration) busy.value.delete(id)
-    if (operation === 'quota') activeClaimAccount = null
+    if (operation === 'quota' && session === sessionGeneration) activeClaimAccount = null
+  }
+}
+
+/** Refresh each target, then claim each distinct offer once, serially through the official SDK. */
+async function claimAll(ids?: string[]) {
+  if (batchClaim.value?.running || activeClaimAccount !== null || refreshProgress.value) return
+  const targets = (overview.value?.accounts ?? []).filter((a) => ids ? ids.includes(a.id) : a.enabled)
+  const session = sessionGeneration
+  const generation = claimGeneration
+  const current = () => session === sessionGeneration && generation === claimGeneration
+  const progress = { running: true, cancelled: false, done: 0, total: targets.length, accountName: '', results: [] as ClaimTaskResult[] }
+  batchClaim.value = progress
+  const record = (account: Account, plan: ClaimPlan | null, status: ClaimTaskResult['status'], message: string) => {
+    if (session !== sessionGeneration || !batchClaim.value) return
+    batchClaim.value.results.push({ accountId: account.id, accountName: account.name, planId: plan?.planId ?? null,
+      planName: plan?.name ?? null, status, message })
+  }
+  try {
+    for (const account of targets) {
+      if (!current()) break
+      batchClaim.value!.accountName = account.name
+      if (busy.value.has(account.id)) {
+        record(account, null, 'skipped', '账号正在执行其他操作，已跳过')
+        batchClaim.value!.done++
+        continue
+      }
+      busy.value.add(account.id)
+      activeClaimAccount = account.id
+      try {
+        const result = await refreshAccount(account.id)
+        if (!current()) break
+        const queryError = [result.eligibility.error, result.eligibility.activation?.error, result.eligibility.currentError].filter(Boolean).join('；')
+        if (!result.eligibility.plans.length) record(account, null, queryError ? 'failed' : 'empty', queryError || '暂无可领取套餐')
+        else if (queryError) record(account, null, 'failed', queryError)
+        const seen = new Set<string>()
+        for (const plan of result.eligibility.plans) {
+          if (!current()) break
+          if (seen.has(plan.planId)) continue
+          seen.add(plan.planId)
+          let submitted = false
+          try {
+            const prepared = await api<{ preparationId: string; plan: ClaimPlan }>(
+              `/accounts/${encodeURIComponent(account.id)}/claim/start`, 'POST', { planId: plan.planId },
+            )
+            if (!current()) break
+            const proof = await runCaptcha({ interactive: false })
+            if (!current()) break
+            submitted = true
+            const reply = await api<{ results: ClaimResult[] }>(`/accounts/${encodeURIComponent(account.id)}/claim`, 'POST', {
+              planId: prepared.plan.planId, preparationId: prepared.preparationId, captchaParam: proof.param, captchaRegion: proof.region,
+            })
+            if (session !== sessionGeneration) return
+            const outcome = reply.results[0]
+            record(account, plan, outcome?.unknown ? 'unknown' : outcome?.ok ? 'claimed' : outcome?.alreadyClaimed ? 'already_claimed' : 'failed',
+              outcome?.unknown ? '提交结果未知，请刷新套餐并人工确认' : outcome?.ok ? '领取成功' : outcome?.msg || '领取未返回结果')
+            if (!outcome?.ok && !outcome?.alreadyClaimed) break
+          } catch (error) {
+            if (session !== sessionGeneration || (!current() && !submitted)) break
+            const interactive = (error as { code?: string }).code === 'captcha_interactive'
+            record(account, plan, submitted ? 'unknown' : interactive ? 'needs_verification' : 'failed',
+              submitted ? '提交结果未知，请刷新套餐并人工确认' : error instanceof Error ? error.message : '领取失败')
+            break
+          } finally { if (session === sessionGeneration) cancelCaptcha() }
+        }
+      } catch (error) {
+        if (current()) record(account, null, 'failed', error instanceof Error ? error.message : '资格刷新失败')
+      } finally {
+        if (session === sessionGeneration) {
+          busy.value.delete(account.id)
+          activeClaimAccount = null
+          if (batchClaim.value) batchClaim.value.done++
+        }
+      }
+    }
+  } finally {
+    if (session === sessionGeneration && batchClaim.value) {
+      batchClaim.value.running = false
+      batchClaim.value.accountName = ''
+      if (refreshPromise) await refreshPromise
+      if (session === sessionGeneration) await refresh()
+    }
   }
 }
 
@@ -245,7 +330,7 @@ async function refreshAccount(id: string) {
 
 /** Limit upstream concurrency and keep per-account failures visible. */
 async function refreshQualifications(ids?: string[]) {
-  if (refreshProgress.value) return
+  if (refreshProgress.value || batchClaim.value?.running) return
   const targets = ids ?? overview.value?.accounts.map((a) => a.id) ?? []
   const generation = sessionGeneration
   refreshProgress.value = { done: 0, total: targets.length }
@@ -411,6 +496,8 @@ export function useConsole() {
     busy,
     refreshingAccounts,
     refreshProgress,
+    batchClaim,
+    claimAll,
     refreshQualifications,
     syncAuthorizedAccount,
     toasts,

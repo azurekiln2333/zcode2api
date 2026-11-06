@@ -10,6 +10,7 @@ pool-*.json
 security.json
 onboard-flows.json
 zcode-version-cache.json
+auto-claim.json
 !zcode-profile.json
 
 # 运行时产物

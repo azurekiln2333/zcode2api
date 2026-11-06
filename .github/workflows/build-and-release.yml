@@ -32,6 +32,7 @@ jobs:
       - name: Verify backend (syntax + boot + smoke)
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
+          ZCGW_TEST_CHROMIUM_PATH: /usr/bin/google-chrome
         run: bash scripts/ci-backend.sh
 
   image:

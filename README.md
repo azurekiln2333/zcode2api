@@ -4,10 +4,9 @@
 
 **智谱 ZCode 账号池管理控制台 · Anthropic / OpenAI 双协议反代网关**
 
-把 ZCode 客户端专属额度（GLM-5.3 / GLM-5.3-Flash）反向代理成标准 API：多账号加权调度轮换、Web 面板纳管、多密钥分发、IP 管控、用量审计 —— **Node 服务，零 npm 依赖，Docker 一键部署**。
+把 ZCode 客户端专属额度（GLM-5.3 / GLM-5.3-Flash）反向代理成标准 API：多账号加权调度轮换、Web 面板纳管、多密钥分发、IP 管控、用量审计 —— **Node 服务，支持每日定时领取，Docker 一键部署**。
 
 ![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=nodedotjs&logoColor=white)
-![零依赖](https://img.shields.io/badge/npm%20依赖-0-22c55e)
 ![Docker](https://img.shields.io/badge/Docker-一键部署-2496ED?logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-22c55e)
 
@@ -42,7 +41,7 @@
 | 限流了只能干等 | 自动冷却换号、指数退避熔断、粘性会话保缓存 |
 | 想分给朋友/多设备没门道 | 多密钥分发：各自独立有效期 / 配额 / 模型 / IP 白名单 |
 | 不知道谁用了多少 | 每次调用的模型、Token、延迟、来源 IP 全量留痕 |
-| 部署要装一堆依赖 | **Node 服务，零 npm 依赖**；Docker 镜像内置 curl |
+| 部署要装一堆依赖 | **Docker 一键部署**；镜像内置 curl 和自动验证所需 Chromium |
 
 **重要说明（3012 风控原理）**：上游对请求体中的 `system` 提示词做**内容指纹校验**——只接受 ZCode 客户端官方那份 10703 字符的原文。本网关的解法是：`system` 字段原样透传官方三段，应用的 system 指令降级为一个块插入首条 user 消息。这是整个项目能跑通的关键，也是唯一的"逆向"点，详见 `zcode-profile.json`。
 
@@ -167,11 +166,14 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 docker run -d --name zcode2api -p 127.0.0.1:8787:8787 -v /opt/zcode2api/data:/app/data ghcr.io/azurekiln2333/zcode2api:latest
 ```
 
-### 裸机（零依赖）
+### 裸机
 
 ```bash
-node zcgw-server.mjs        # Node.js >= 22，无需 npm install；安装 curl 可使用与 zcode-switch 一致的传输通道
+npm ci --omit=dev           # Node.js >= 22；定时领取使用 playwright-core 驱动 Chromium
+node zcgw-server.mjs
 ```
+
+安装 curl 可使用与 zcode-switch 一致的查询通道。定时领取另需安装 Chromium，默认路径 `/usr/bin/chromium`；其他路径使用 `ZCGW_CHROMIUM_PATH` 指定。Docker 镜像已包含这些组件。基础网关与手动领取不依赖后台浏览器。
 
 启动后浏览器打开 `http://<IP>:8787/`：
 
@@ -276,7 +278,11 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 
 ### 额度和领取资格
 
-账号池的「一键刷新资格」会逐批刷新全部账号；每个账号也可单独刷新。手动刷新会按 `zcode-switch` 的流程先上报 `app_launch`、`app_daily_active`，再查询可领取套餐，同时刷新余额。激活上报成功后是否有资格由上游决定；领取时仍需点击对应套餐并完成人机验证。
+账号池的「一键刷新资格」会逐批刷新全部账号；每个账号也可单独刷新。手动刷新会按 `zcode-switch` 的流程先上报 `app_launch`、`app_daily_active`，再查询可领取套餐，同时刷新余额。激活上报成功后是否有资格由上游决定。
+
+- **一键领取**：账号管理顶部直接领取已勾选账号的套餐；未勾选时处理全部已启用账号。每个账号先刷新资格，再按上游返回的套餐逐一验证与提交，不依赖套餐名称。显示逐项结果，可以停止；需要人工验证时先跳过该账号，结束后可单独点击「领取」。离开账号页会停止尚未提交的手动批量操作。
+- **每日定时领取**：网关设置中开启并保存时间、IANA 时区（默认北京时间）。服务器每天检测已启用账号并领取，关闭网页仍执行；也可点击「立即检测并领取」。与 zcode-switch 一样运行官方验证码 SDK 的无感验证，要求人工验证时记录原因，不绕过挑战、不把失败算作领取成功。
+- 定时设置、当天执行记录及领取去重记录保存在 `data/auto-claim.json`。开启或重启后，若当天已过设定时间且未执行，将补跑一次；不会补跑之前漏过的日期。同活动已成功领取或提交结果未知时不自动重复提交。重启中断和请求超时显示在最近执行结果中。自动验证浏览器仅在任务有可领取套餐时启动，轮次结束即关闭。
 
 - **ZCode 套餐**：查询 `zcode.z.ai/api/v1/zcode-plan/billing/balance`，按上游返回的套餐、模型分别显示余额及重置时间。
 - **Z.ai / BigModel Coding Plan**：查询对应平台的 `/api/monitor/usage/quota/limit`，各时间窗口单独展示。在「编辑账号」中设置查询平台及对应的 Coding Plan API Key。Z.ai 未填写 API Key 时会尝试已有的 Z.ai 登录凭证；查询权限不足时，可在编辑账号中改用 API Key。
@@ -285,7 +291,7 @@ weight = (余额占比 ×10 + 闲置补偿 0.5/h 封顶5 + 成功率 ×3) × 账
 - 后台每 10 分钟刷新余额，设置 `PANEL_KEY` 后仍正常运行。面板每 15 秒读取快照；需要立即查询上游时使用刷新资格按钮。OAuth 登录或重新授权后，服务端自动激活资格并刷新额度，页面显示刷新进度与结果；仅更新授权不会自动领取套餐。顶部统一使用「登录新账号」，在弹窗中选择国际或国内平台。
 - **连通自检**：管理端 `POST /api/accounts/:id/selftest` 立即返回 HTTP 202 和 `jobId`，前端通过 `GET /api/accounts/:id/selftest/:jobId` 查询结果。每次只发起一次真实上游推理，同账号重复点击复用正在进行的任务；默认 45 秒超时，结果保留 5 分钟。HTTP 错误、业务拒绝、空响应、非 JSON、连接中断与超时均显示失败原因，不再把错误响应判为成功。`ZCGW_SELFTEST_TIMEOUT_MS` 可调整探测超时，最长 60 秒。管理入口本身返回 Cloudflare 错误时，仍需结合源站日志定位，不能据此判断上游账号授权状态。
 - 激活使用登录授权返回的用户身份，每个账号 60 秒内复用上次结果，避免连续点击重复上报；激活失败会显示独立提示，仍继续查询套餐。缺少授权用户信息时需重新登录该账号，已有 OAuth 凭证可在启动时尝试补全身份。
-- 后台刷新、面板轮询及 `/claimable` 查询不会触发激活。停用账号也可手动刷新，刷新不会重新启用账号或自动领取。
+- 常规余额刷新、面板轮询及 `/claimable` 查询不会触发激活；定时领取任务会先激活并刷新资格。停用账号也可手动刷新，刷新不会重新启用账号或自动领取。
 
 API Key 保存在数据目录的 `accounts.json`，面板只返回是否已配置。领取资格同时查询 preview 和 marketing；任一通道失败会单独提示，避免把失败误报为「无可领取套餐」。
 

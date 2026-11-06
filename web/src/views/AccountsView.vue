@@ -24,6 +24,7 @@ import {
   FilterX,
   Waypoints,
   Cloud,
+  Gift,
 } from '@lucide/vue'
 import { api } from '../api'
 import {
@@ -44,7 +45,7 @@ import QuotaDetails from '../components/QuotaDetails.vue'
 import ClaimDetailsDialog from '../components/ClaimDetailsDialog.vue'
 
 const emit = defineEmits<{ navigate: [page: Page] }>()
-const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts, captchaState, captchaMessage, cancelClaim } = useConsole()
+const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts, captchaState, captchaMessage, cancelClaim, claimAll, batchClaim } = useConsole()
 onUnmounted(cancelClaim)
 const search = ref('')
 const tab = ref('all')
@@ -199,15 +200,33 @@ async function batch(enabled: boolean) {
       <button class="button token-shortcut" @click="emit('navigate', 'overview')">
         <Wallet :size="15" />用量统计
       </button>
-      <button class="button" :disabled="!!refreshProgress || !accounts.length" @click="refreshQualifications()">
+      <button class="button" :disabled="!!refreshProgress || !!batchClaim?.running || !accounts.length" @click="refreshQualifications()">
         <RefreshCw :size="15" :class="{ spin: !!refreshProgress }" />
         {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '一键刷新资格' }}
+      </button>
+      <button class="button" :disabled="!!refreshProgress || !!batchClaim?.running || captchaState !== 'idle' || !accounts.length || !!overview?.claimAutomation?.running"
+        @click="claimAll(selected.size ? [...selected] : undefined)">
+        <Gift :size="15" />{{ batchClaim?.running ? `领取中 ${batchClaim.done}/${batchClaim.total}` : selected.size ? `一键领取（${selected.size} 个）` : '一键领取' }}
       </button>
       <button class="button primary" @click="startOnboard()"
         ><Plus :size="17" />登录新账号</button
       >
     </div>
   </div>
+  <section v-if="batchClaim" class="section-panel claim-batch-panel" aria-live="polite">
+    <div class="claim-batch-heading">
+      <strong>{{ batchClaim.running ? `正在处理 ${batchClaim.accountName}` : batchClaim.cancelled ? '一键领取已停止' : '一键领取已完成' }} · {{ batchClaim.done }}/{{ batchClaim.total }} 个账号</strong>
+      <button v-if="batchClaim.running" class="button" :disabled="batchClaim.cancelled" @click="cancelClaim">{{ batchClaim.cancelled ? '正在停止' : '停止领取' }}</button>
+      <button v-else class="icon-button" aria-label="收起领取结果" @click="batchClaim = null"><X :size="16" /></button>
+    </div>
+    <p class="subtle">{{ batchClaim.results.filter(r => r.status === 'claimed').length }} 个套餐领取成功；需要人工验证的账号可单独点击领取。</p>
+    <div class="claim-result-list">
+      <div v-for="(result, index) in batchClaim.results" :key="index" class="claim-result-row">
+        <strong>{{ result.accountName }}</strong><span>{{ result.planName || '资格检测' }}</span><span :class="{ 'success-text': result.status === 'claimed' }">{{ result.message }}</span>
+        <button v-if="result.status === 'needs_verification' && !batchClaim.running" class="button small" @click="openClaimDetails(result.accountId, result.planId || undefined)">领取</button>
+      </div>
+    </div>
+  </section>
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-top">

@@ -4481,3 +4481,20 @@ button.button,
     scroll-behavior: auto !important;
   }
 }
+/* Batch and scheduled claim results share a compact, scrollable list. */
+.claim-batch-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.claim-batch-panel { padding: 18px 24px; }
+.auto-claim-panel > form { padding: 0 24px 20px; }
+.auto-claim-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.auto-claim-panel > .form-error { margin: 0 24px 16px; }
+.claim-result-list { max-height: 300px; overflow: auto; margin-top: 12px; }
+.claim-result-row { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(120px, 1.2fr) minmax(180px, 2fr) auto; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
+.claim-result-row:last-child { border-bottom: 0; }
+.auto-claim-fields { display: flex; flex-wrap: wrap; gap: 18px; margin: 18px 0 12px; }
+.auto-claim-fields label { display: grid; gap: 8px; font-size: 13px; }
+.auto-claim-fields input { min-width: 170px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; color: inherit; background: transparent; }
+.auto-claim-panel .subtle, .claim-batch-panel .subtle { font-size: 12px; margin: 12px 0; }
+.claim-run-results { padding: 16px 24px; border-top: 1px solid var(--line); }
+.claim-run-results summary { cursor: pointer; font-size: 13px; line-height: 1.7; }
+@media (max-width: 700px) { .claim-result-row { grid-template-columns: 1fr 1fr; } .claim-result-row > span:nth-child(3) { grid-column: 1 / -1; } .auto-claim-fields input { min-width: 0; width: 100%; } }
+@media (max-width: 700px) { .auto-claim-panel > form { padding: 0 16px 16px; } .claim-run-results, .claim-batch-panel { padding: 16px; } .auto-claim-actions .button { font-size: 12px; } }

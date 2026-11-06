@@ -559,4 +559,29 @@ test('authenticated console refresh preserves distinct sources and partial failu
     currentReply = undefined;
   });
 
+  await t.test('daily claim settings API is authenticated, validated and durable, and empty jobs finish asynchronously', async () => {
+    const unauthorized = await fetch(`${base}/api/claim-automation`);
+    assert.equal(unauthorized.status, 401);
+    const invalid = await api('/api/claim-automation', 'PATCH', { enabled: 'true', time: '25:00' });
+    assert.equal(invalid.status, 400);
+    const saved = await api('/api/claim-automation', 'PATCH', { enabled: false, time: '07:45', timezone: 'UTC' });
+    assert.equal(saved.status, 200);
+    assert.deepEqual(saved.body.settings, { enabled: false, time: '07:45', timezone: 'UTC' });
+    assert.equal((await api('/api/overview')).body.claimAutomation.settings.time, '07:45');
+    assert.equal(JSON.parse(await readFile(path.join(dataDir, 'auto-claim.json'))).settings.timezone, 'UTC');
+    for (const acc of (await api('/api/overview')).body.accounts) await api(`/api/accounts/${acc.id}`, 'PATCH', { enabled: false });
+    const before = claims;
+    const run = await api('/api/claim-automation/run', 'POST', {});
+    assert.equal(run.status, 202);
+    let result;
+    for (let i = 0; i < 30; i++) {
+      result = (await api('/api/claim-automation')).body;
+      if (!result.running) break;
+      await delay(10);
+    }
+    assert.equal(result.lastRun.status, 'completed');
+    assert.equal(result.lastRun.total, 0);
+    assert.equal(claims, before);
+  });
+
 });

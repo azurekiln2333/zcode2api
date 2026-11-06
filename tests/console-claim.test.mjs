@@ -15,6 +15,78 @@ async function loadModule(file, harness) {
 const ref = (value) => ({ value });
 const computed = (get) => ({ get value() { return get(); } });
 
+test('one-click claim refreshes selected accounts, skips interactive verification, deduplicates and stops on terminal errors', async (t) => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout: () => 0 };
+  t.after(() => { globalThis.window = originalWindow; });
+  const calls = [];
+  let verification = 0;
+  let unblock;
+  const plan = (planId) => ({ planId, name: planId });
+  const module = await loadModule('console', {
+    ref, computed, ApiError: class extends Error {}, captchaState: ref('idle'), captchaMessage: ref(''), cancelCaptcha() {},
+    visibleQuotaSources: (v) => v,
+    runCaptcha: async (options) => {
+      assert.equal(options.interactive, false);
+      if (++verification === 1) throw Object.assign(new Error('人工验证'), { code: 'captcha_interactive' });
+      return { param: 'proof', region: 'cn' };
+    },
+    api: async (path, method, body) => {
+      calls.push({ path, method, body });
+      if (path.endsWith('/refresh')) {
+        if (path.includes('/interactive/')) await new Promise((resolve) => { unblock = resolve; });
+        return { eligibility: { plans: [plan('first'), plan('first'), plan('second')] }, quotaSources: [] };
+      }
+      if (path.endsWith('/claim/start')) return { preparationId: 'preparation', plan: plan(body.planId) };
+      if (path.endsWith('/claim')) return { results: [path.includes('/rejected/') ? { ok: false, code: 3007, msg: '验证失败' } : { ok: true }] };
+      return { accounts: [], settings: {}, stats: {} };
+    },
+  });
+  const state = module.useConsole();
+  state.overview.value = { accounts: ['interactive', 'rejected', 'success', 'excluded'].map((id) => ({ id, name: id, enabled: true })), stats: {}, settings: {} };
+  const running = state.claimAll(['interactive', 'rejected', 'success']);
+  await state.claimAll();
+  await state.action('excluded', 'quota');
+  assert.equal(calls.length, 1, 'duplicate batch and single claims are blocked while running');
+  unblock();
+  await running;
+  assert.deepEqual(state.batchClaim.value.results.map((r) => r.status), ['needs_verification', 'failed', 'claimed', 'claimed']);
+  assert.equal(calls.filter((c) => c.path.endsWith('/claim')).length, 3);
+  assert.equal(verification, 4);
+  assert.equal(state.batchClaim.value.running, false);
+  assert.equal(state.busy.value.size, 0);
+  assert.ok(!calls.some((c) => c.path.includes('/excluded/')));
+});
+
+test('cancelling a batch while captcha loads prevents late proof submission', async (t) => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout: () => 0 };
+  t.after(() => { globalThis.window = originalWindow; });
+  const calls = [];
+  let finish;
+  const module = await loadModule('console', {
+    ref, computed, ApiError: class extends Error {}, captchaState: ref('idle'), captchaMessage: ref(''), cancelCaptcha() {},
+    visibleQuotaSources: (v) => v,
+    runCaptcha: () => new Promise((resolve) => { finish = resolve; }),
+    api: async (path) => {
+      calls.push(path);
+      if (path.endsWith('/refresh')) return { eligibility: { plans: [{ planId: 'offer', name: 'offer' }] } };
+      if (path.endsWith('/claim/start')) return { preparationId: 'prepared', plan: { planId: 'offer' } };
+      return { accounts: [], settings: {}, stats: {} };
+    },
+  });
+  const state = module.useConsole();
+  state.overview.value = { accounts: [{ id: 'one', name: 'one', enabled: true }] };
+  const pending = state.claimAll();
+  while (!finish) await new Promise((resolve) => setImmediate(resolve));
+  state.cancelClaim();
+  finish({ param: 'late-proof' });
+  await pending;
+  assert.equal(state.batchClaim.value.cancelled, true);
+  assert.equal(state.batchClaim.value.running, false);
+  assert.ok(!calls.some((p) => p.endsWith('/claim')));
+});
+
 test('captcha proof includes region; cancellation and late SDK callbacks cannot hang or resolve another verification', async (t) => {
   const originalWindow = globalThis.window, originalDocument = globalThis.document;
   t.after(() => { globalThis.window = originalWindow; globalThis.document = originalDocument; });

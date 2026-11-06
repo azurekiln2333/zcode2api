@@ -30,6 +30,7 @@ let instance: { destroy?: () => void } | null = null
 let pendingResolve: ((proof: CaptchaProof) => void) | null = null
 let pendingReject: ((err: Error) => void) | null = null
 let tracelessTimer = 0
+let preparationTimer = 0
 
 function loadSdk(): Promise<void> {
   if (typeof (window as any).initAliyunCaptcha === 'function') return Promise.resolve()
@@ -51,6 +52,7 @@ async function ensureConfig(): Promise<CaptchaConfig> {
 
 function cleanup() {
   clearTimeout(tracelessTimer)
+  clearTimeout(preparationTimer)
   try {
     instance?.destroy?.()
   } catch {}
@@ -63,6 +65,7 @@ function initCaptcha(cfg: CaptchaConfig, current: () => boolean, onFail: (why: u
   cleanup()
   const holder = document.getElementById('zcgw-captcha-holder')
   if (holder) holder.style.display = ''
+  tracelessTimer = window.setTimeout(() => { if (current()) onFail('init-timeout') }, 15000)
   ;(window as any).AliyunCaptchaConfig = { region: cfg.region, prefix: cfg.prefix }
   ;(window as any).initAliyunCaptcha({
     SceneId: cfg.sceneId,
@@ -73,6 +76,7 @@ function initCaptcha(cfg: CaptchaConfig, current: () => boolean, onFail: (why: u
     button: '#zcgw-captcha-btn',
     getInstance: (i: any) => {
       if (!current()) { i.destroy?.(); return }
+      clearTimeout(tracelessTimer)
       instance = i
       if (typeof i.startTracelessVerification === 'function') {
         i.startTracelessVerification()
@@ -122,7 +126,7 @@ function initCaptcha(cfg: CaptchaConfig, current: () => boolean, onFail: (why: u
  * 跑一次人机验证，resolve 出 captchaVerifyParam。
  * 无痕验证失败/超时会转交互模式，由用户点按钮完成。
  */
-export function runCaptcha(): Promise<CaptchaProof> {
+export function runCaptcha(options: { interactive?: boolean } = {}): Promise<CaptchaProof> {
   if (pendingResolve) return Promise.reject(new Error('上一次验证还没完成，请先完成或取消'))
   const id = ++verificationId
   const current = () => id === verificationId && pendingResolve !== null
@@ -131,6 +135,15 @@ export function runCaptcha(): Promise<CaptchaProof> {
   return new Promise<CaptchaProof>((resolve, reject) => {
     pendingResolve = resolve
     pendingReject = reject
+    preparationTimer = window.setTimeout(() => {
+      if (!current()) return
+      pendingResolve = null
+      pendingReject = null
+      captchaState.value = 'idle'
+      captchaMessage.value = ''
+      cleanup()
+      reject(new Error('人机验证准备超时，请检查网络后重试'))
+    }, 30000)
     void (async () => {
       const cfg = await ensureConfig()
       if (!current()) return
@@ -140,6 +153,15 @@ export function runCaptcha(): Promise<CaptchaProof> {
       ensureHolder()
       initCaptcha(cfg, current, () => {
         if (!current()) return
+        if (options.interactive === false) {
+          pendingResolve = null
+          pendingReject = null
+          captchaState.value = 'idle'
+          captchaMessage.value = ''
+          cleanup()
+          reject(Object.assign(new Error('需要人工验证，请点击该账号的领取按钮完成验证'), { code: 'captcha_interactive' }))
+          return
+        }
         captchaState.value = 'interactive'
         captchaMessage.value = '需要人工验证：请点击下方按钮完成拼图'
       })

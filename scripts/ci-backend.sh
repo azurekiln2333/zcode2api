@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "==> node $(node --version)"
+npm ci --omit=dev --no-audit --no-fund --loglevel=error
 echo "==> 语法检查"
 node --check zcgw-server.mjs
 node --check zcgw-fingerprint.mjs
@@ -12,6 +13,8 @@ node --check zcgw-quota.mjs
 node --check zcgw-claim.mjs
 node --check zcgw-upstream.mjs
 node --check zcgw-version.mjs
+node --check zcgw-auto-claim.mjs
+node --check zcgw-captcha-browser.mjs
 node scripts/check-version.mjs
 node --test tests/*.test.mjs
 

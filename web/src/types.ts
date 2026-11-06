@@ -82,6 +82,7 @@ export interface ClaimResult {
   code?: number | string
   msg?: string
   alreadyClaimed?: boolean
+  unknown?: boolean
   planName?: string
   effectiveAt?: number | null
   startsAt?: number | null
@@ -243,6 +244,36 @@ export interface Overview {
   settings: Settings
   hourly: HourBucket[]
   stats: Stats
+  claimAutomation?: ClaimAutomation
+}
+
+export interface ClaimTaskResult {
+  accountId: string
+  accountName: string
+  planId: string | null
+  planName: string | null
+  status: 'claimed' | 'already_claimed' | 'failed' | 'needs_verification' | 'empty' | 'skipped' | 'unknown'
+  message: string
+  at?: string
+}
+
+export interface ClaimAutomation {
+  settings: { enabled: boolean; time: string; timezone: string }
+  nextRunAt: string | null
+  running: boolean
+  error: string | null
+  lastRun: {
+    id: string
+    source: 'manual' | 'scheduled'
+    status: 'running' | 'stopping' | 'completed' | 'cancelled' | 'interrupted' | 'failed'
+    startedAt: string
+    finishedAt: string | null
+    total: number
+    done: number
+    accountName: string | null
+    error: string | null
+    results: ClaimTaskResult[]
+  } | null
 }
 
 export interface ModelAccount {

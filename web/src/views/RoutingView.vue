@@ -16,6 +16,7 @@ import {
 import { api } from '../api'
 import { notify, useConsole, accountState } from '../console'
 import type { Settings } from '../types'
+import AutoClaimSettings from '../components/AutoClaimSettings.vue'
 
 const { overview, accounts, refresh } = useConsole()
 
@@ -190,6 +191,7 @@ async function save() {
       </button>
     </div>
   </div>
+  <AutoClaimSettings />
   <form @submit.prevent="save">
     <section class="section-panel">
       <header class="section-heading">
