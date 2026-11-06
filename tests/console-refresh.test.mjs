@@ -36,6 +36,8 @@ test('authenticated console refresh preserves distinct sources and partial failu
   let claims = 0;
   let claimBody;
   let balanceCalls = 0;
+  let balanceGate;
+  let balanceWaiting = false;
   const activationEvents = [];
   const requests = [];
   const upstream = http.createServer(async (req, res) => {
@@ -77,6 +79,10 @@ test('authenticated console refresh preserves distinct sources and partial failu
     }
     if (url.pathname.endsWith('/billing/balance')) {
       balanceCalls++;
+      if (balanceGate && req.headers.authorization === `Bearer ${jwt('unconfigured')}`) {
+        balanceWaiting = true;
+        await balanceGate;
+      }
       if (balanceReply) return reply(balanceReply);
       if (failBalance) return send(null, 1006, 401);
       return send({
@@ -422,9 +428,14 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.ok(!JSON.stringify(overview).includes('test-profile-token'));
   });
 
-  await t.test('re-login persists the authorized profile and bypasses an unavailable activation cache', async () => {
+  await t.test('re-login automatically refreshes after old lookups, replacing the unavailable activation cache', async () => {
     const before = activationEvents.length;
     const claimCount = claims;
+    let releaseBalance;
+    balanceGate = new Promise((resolve) => { releaseBalance = resolve; });
+    const oldRefresh = api('/api/accounts/unconfigured/refresh', 'POST', {});
+    for (let i = 0; i < 100 && !balanceWaiting; i++) await delay(10);
+    assert.ok(balanceWaiting);
     const started = await api('/api/onboard/start', 'POST', { provider: 'bigmodel' });
     assert.equal(started.status, 200);
     const loggedIn = await api(`/api/onboard/poll/${started.body.flowId}`);
@@ -432,12 +443,27 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.equal(loggedIn.body.status, 'ready');
     assert.equal(loggedIn.body.added, false);
     assert.equal(loggedIn.body.label, 'unconfigured');
-    assert.equal(activationEvents.length, before, 'login alone does not trigger activation');
+    assert.equal(loggedIn.body.eligibilityRefreshing, true);
+    assert.equal((await api('/api/overview')).body.accounts.find((a) => a.id === 'unconfigured').eligibilityRefreshing, true);
     const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
     assert.equal(saved.find((a) => a.label === 'unconfigured').activationUserId, 'reauthed-profile');
     assert.equal(saved.find((a) => a.label === 'unconfigured').jwt, renewedJwt, 're-login must replace the stored gateway JWT');
-    const refreshed = (await api('/api/accounts/unconfigured/refresh', 'POST', {})).body;
+    releaseBalance();
+    balanceGate = null;
+    await oldRefresh;
+    const waitForAutomaticRefresh = async () => {
+      for (let i = 0; i < 200; i++) {
+        const account = (await api('/api/overview')).body.accounts.find((a) => a.id === 'unconfigured');
+        if (!account.eligibilityRefreshing) return account;
+        await delay(10);
+      }
+      assert.fail('authorization refresh did not finish');
+    };
+    const refreshed = await waitForAutomaticRefresh();
     assert.equal(refreshed.eligibility.activation.status, 'ready');
+    assert.equal(refreshed.eligibility.activation.error, null);
+    assert.equal(refreshed.quotaSources.find((s) => s.id === 'billing').status, 'ready');
+    assert.equal(requests.filter((r) => r.path.endsWith('/billing/balance')).at(-1).headers.authorization, `Bearer ${renewedJwt}`);
     assert.deepEqual(activationEvents.slice(before).map((e) => e.body.user_id), ['reauthed-profile', 'reauthed-profile']);
     assert.equal(claims, claimCount);
     assert.ok(!JSON.stringify((await api('/api/overview')).body).includes('reauthed-profile'));
@@ -450,6 +476,10 @@ test('authenticated console refresh preserves distinct sources and partial failu
     });
     assert.equal(redeemed.status, 200);
     assert.equal(redeemed.body.status, 'ready');
+    assert.equal(redeemed.body.eligibilityRefreshing, true);
+    assert.equal((await waitForAutomaticRefresh()).eligibility.activation.status, 'ready');
+    assert.equal(activationEvents.length, before + 4, 'each completed authorization refreshes once');
+    assert.equal(claims, claimCount, 'authorization never submits a claim');
   });
 
   await t.test('prepare validates the selected offer before captcha and consumes the preparation once', async () => {

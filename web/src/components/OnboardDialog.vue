@@ -2,7 +2,6 @@
 import { onBeforeUnmount, ref } from 'vue'
 import {
   Check,
-  Copy,
   ExternalLink,
   LoaderCircle,
   RefreshCw,
@@ -12,11 +11,12 @@ import {
   CircleAlert,
 } from '@lucide/vue'
 import { api } from '../api'
-import { copy, notify } from '../console'
+import { notify, useConsole } from '../console'
 import ModalShell from './ModalShell.vue'
 
-const props = defineProps<{ initialProvider?: 'zai' | 'bigmodel' | null }>()
 const emit = defineEmits<{ close: [] }>()
+const { syncAuthorizedAccount } = useConsole()
+interface OnboardResult { status: string; label?: string }
 
 interface Flow {
   flowId: string
@@ -31,6 +31,7 @@ const starting = ref(false)
 const flow = ref<Flow | null>(null)
 const stateText = ref('')
 const finished = ref(false)
+const checking = ref(false)
 const pasteUrl = ref('')
 let pollTimer: number | undefined
 
@@ -45,7 +46,8 @@ function stopPoll() {
     pollTimer = undefined
   }
 }
-onBeforeUnmount(stopPoll)
+let disposed = false
+onBeforeUnmount(() => { disposed = true; stopPoll() })
 
 async function start(p: 'zai' | 'bigmodel') {
   stopPoll()
@@ -55,6 +57,7 @@ async function start(p: 'zai' | 'bigmodel') {
   stateText.value = '正在创建授权链接…'
   try {
     flow.value = await api<Flow>('/onboard/start', 'POST', { provider: p })
+    if (disposed) return
     stateText.value = '自动等待授权结果…'
     const interval = Math.max(2, flow.value.pollIntervalSec || 2) * 1000
     pollTimer = window.setInterval(() => void pollOnce(), interval)
@@ -66,9 +69,10 @@ async function start(p: 'zai' | 'bigmodel') {
 }
 
 async function pollOnce() {
-  if (!flow.value || finished.value) return
+  if (!flow.value || finished.value || checking.value || disposed) return
+  checking.value = true
   try {
-    const r = await api<{ status: string }>(
+    const r = await api<OnboardResult>(
       `/onboard/poll/${encodeURIComponent(flow.value.flowId)}`,
     )
     if (r.status === 'pending') {
@@ -79,7 +83,7 @@ async function pollOnce() {
       stateText.value = `当前状态：${r.status}`
       return
     }
-    await finish()
+    finish(r)
   } catch (e) {
     const status = (e as { status?: number }).status
     if (status === 410) {
@@ -88,22 +92,23 @@ async function pollOnce() {
     } else {
       stateText.value = `等待重连：${e instanceof Error ? e.message : '未知错误'}`
     }
-  }
+  } finally { checking.value = false }
 }
 
 async function submitPaste() {
-  if (!flow.value) return
+  if (!flow.value || finished.value || checking.value || disposed) return
   const url = pasteUrl.value.trim()
   if (!url) {
     stateText.value = '请先粘贴授权完成后浏览器地址栏的链接'
     return
   }
+  checking.value = true
   try {
-    const r = await api<{ status: string }>('/onboard/redeem', 'POST', {
+    const r = await api<OnboardResult>('/onboard/redeem', 'POST', {
       flowId: flow.value.flowId,
       url,
     })
-    if (r.status === 'ready') return await finish()
+    if (r.status === 'ready') return finish(r)
     if (r.status === 'pending')
       stateText.value =
         '提交了但还没生效：确认浏览器已走到授权最后一步；若 code 已被浏览器消费过，稍等自动轮询即可'
@@ -114,14 +119,15 @@ async function submitPaste() {
       stopPoll()
       stateText.value = '授权流程不存在或已过期，请重新发起登录'
     } else stateText.value = `提交失败：${e instanceof Error ? e.message : '未知错误'}`
-  }
+  } finally { checking.value = false }
 }
 
-async function finish() {
+function finish(result: OnboardResult) {
+  if (finished.value || disposed) return
   stopPoll()
   finished.value = true
-  notify('登录成功，账号已纳管；请刷新资格后领取套餐')
-  window.dispatchEvent(new CustomEvent('zcgw-onboarded'))
+  notify('授权成功，正在自动刷新资格与额度…')
+  if (result.label) void syncAuthorizedAccount(result.label)
   emit('close')
 }
 const expireAt = () =>
@@ -160,14 +166,14 @@ const expireAt = () =>
           <span><CircleAlert :size="19" /></span>
           <div>
             <strong>第一步：在浏览器完成 ZCode 登录授权（{{ providerMeta[provider!].title }}）</strong>
-            <p>链接有效至 {{ expireAt() }} · 授权通过后自动纳管并识别身份；领取套餐需刷新资格并完成验证。</p>
+            <p>链接有效至 {{ expireAt() }} · 授权后自动识别身份并刷新资格与额度；领取套餐需查看详情并完成验证。</p>
           </div>
         </div>
         <div class="onboard-actions">
           <a class="button primary" :href="flow.authorizeUrl" target="_blank" rel="noopener noreferrer">
             <ExternalLink :size="15" />打开 ZCode 授权页
           </a>
-          <button type="button" class="button" @click="pollOnce">
+          <button type="button" class="button" :disabled="checking" @click="pollOnce">
             <RefreshCw :size="15" />我已授权，立即检查
           </button>
         </div>
@@ -185,6 +191,7 @@ const expireAt = () =>
             ><button
               class="icon-button"
               aria-label="提交授权链接"
+              :disabled="checking"
               @click="submitPaste"
             >
               <ArrowRight :size="15" />

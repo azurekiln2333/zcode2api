@@ -98,3 +98,72 @@ test('console prepares before captcha, forwards region and stops on 3007 without
   assert.deepEqual(calls.map((c) => c.path), ['/accounts/account%2F1/claim/start'], 'cancellation while preparing must not open captcha later');
   assert.equal(state.busy.value.size, 0);
 });
+
+test('console starts one probe and polls its result without resubmitting after a failed status request', async (t) => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout: (fn, ms) => { if (ms === 1000) queueMicrotask(fn); return 0; } };
+  t.after(() => { globalThis.window = originalWindow; });
+  const calls = [];
+  let failPoll = false;
+  const module = await loadModule('console', {
+    ref, computed, ApiError: class extends Error {}, captchaState: ref('idle'), captchaMessage: ref(''), cancelCaptcha() {},
+    api: async (path, method) => {
+      calls.push({ path, method });
+      if (path.endsWith('/selftest')) return { jobId: 'job-1', status: 'running', result: null };
+      if (path.endsWith('/selftest/job-1')) {
+        if (failPoll) throw new Error('Cloudflare 暂时不可达');
+        return { jobId: 'job-1', status: 'completed', result: { ok: false, account: 'probe', code: 'upstream_http',
+          error: '上游返回 HTTP 502', rayId: 'a5678101b9b51c0a-AMS' } };
+      }
+      if (path === '/overview') return { accounts: [], stats: {}, settings: {} };
+      throw new Error(`unexpected request ${path}`);
+    },
+  });
+  const state = module.useConsole();
+  await state.action('probe', 'probe');
+  assert.deepEqual(calls.map((c) => c.path), ['/accounts/probe/selftest', '/accounts/probe/selftest/job-1', '/overview']);
+  assert.match(state.toasts.value.at(-1).text, /上游返回 HTTP 502.*上游 Ray ID/);
+  assert.equal(state.toasts.value.at(-1).error, true);
+  assert.equal(state.busy.value.size, 0);
+  failPoll = true;
+  calls.length = 0;
+  await state.action('probe', 'probe');
+  assert.deepEqual(calls.map((c) => c.path), ['/accounts/probe/selftest', '/accounts/probe/selftest/job-1']);
+  assert.equal(state.busy.value.size, 0);
+  assert.equal(state.toasts.value.at(-1).text, 'Cloudflare 暂时不可达');
+});
+
+test('authorization synchronization updates account state and stops on session reset without submitting refresh or claim again', async (t) => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout: (fn, ms) => { if (ms === 1000) queueMicrotask(fn); return 0; } };
+  t.after(() => { globalThis.window = originalWindow; });
+  let count = 0, defer = false, resolveRequest;
+  const calls = [];
+  const complete = { id: 'account-1', eligibilityRefreshing: false, quotaSources: [], eligibility: {
+    status: 'ready', plans: [], activation: { status: 'ready', error: null } } };
+  const module = await loadModule('console', {
+    ref, computed, ApiError: class extends Error {}, captchaState: ref('idle'), captchaMessage: ref(''), cancelCaptcha() {},
+    visibleQuotaSources: (sources) => sources,
+    api: async (path, method) => {
+      calls.push({ path, method });
+      assert.equal(path, '/overview');
+      if (defer) return new Promise((resolve) => { resolveRequest = resolve; });
+      count++;
+      return { accounts: [count === 1 ? { ...complete, eligibilityRefreshing: true, eligibility: null } : complete], stats: {}, settings: {} };
+    },
+  });
+  const state = module.useConsole();
+  await state.syncAuthorizedAccount('account-1');
+  assert.equal(count, 2);
+  assert.equal(state.accounts.value[0].eligibility.activation.status, 'ready');
+  assert.equal(state.toasts.value.at(-1).text, '授权已更新，资格与额度已自动刷新');
+  const notifications = state.toasts.value.length;
+  defer = true;
+  const waiting = state.syncAuthorizedAccount('account-1');
+  state.reset();
+  resolveRequest({ accounts: [complete], stats: {}, settings: {} });
+  await waiting;
+  assert.equal(state.accounts.value.length, 0);
+  assert.equal(state.toasts.value.length, notifications);
+  assert.ok(calls.every((call) => call.path === '/overview' && call.method === undefined));
+});

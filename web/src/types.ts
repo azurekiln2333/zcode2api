@@ -120,6 +120,23 @@ export interface AccountRefresh {
   eligibility: Eligibility
 }
 
+export interface SelfTestResult {
+  ok: boolean
+  account: string
+  text?: string
+  ms?: number
+  error?: string
+  code?: string
+  upstreamStatus?: number | null
+  rayId?: string | null
+}
+
+export interface SelfTestJob {
+  jobId: string
+  status: 'running' | 'completed'
+  result: SelfTestResult | null
+}
+
 export interface Account {
   id: string
   name: string
@@ -140,6 +157,7 @@ export interface Account {
   codingPlanProvider: 'zai' | 'bigmodel'
   quotaSources: QuotaSource[]
   eligibility: Eligibility | null
+  eligibilityRefreshing?: boolean
   quotaProtection?: QuotaProtectionState
   status: 'pending' | 'healthy' | 'unhealthy'
   checkedAt: string | null

@@ -243,11 +243,18 @@ async function identifyAll(force = false) {
   for (const rec of arr) {
     if (!rec.zaiAccessToken) continue;
     const d = await fetchCustomerInfo(rec.zaiAccessToken);
-    if (d && mergeCustomerInfo(rec, d)) updated += 1;
+    if (!d) continue;
+    // A profile request may finish after reauthorization; never restore its old JWT.
+    const latest = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+    const current = latest.find((a) => a.jwt === rec.jwt && a.zaiAccessToken === rec.zaiAccessToken);
+    if (current && mergeCustomerInfo(current, d)) {
+      fs.writeFileSync(ACC_FILE, JSON.stringify(latest, null, 2));
+      const live = accounts.find((a) => a.jwt === rec.jwt && a.zaiAccessToken === rec.zaiAccessToken);
+      if (live) { mergeCustomerInfo(live, d); live.identity = displayIdentity(live); }
+      updated += 1;
+    }
   }
   if (updated) {
-    fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
-    accounts = readAccountFile();
     log(`自动识别账号身份：更新 ${updated} 个`);
   }
   return { updated, total: arr.length, withToken: arr.filter((a) => a.zaiAccessToken).length };
@@ -599,6 +606,7 @@ const quotaSources = new Map();
 const eligibilityCache = new Map();
 const activationCache = new Map();
 const accountRefreshes = new Map();
+const onboardRefreshes = new Map();
 function setQuotaCache(list) {
   for (const a of list) {
     if (!a.label || a.error) continue;
@@ -697,7 +705,7 @@ function markFailure(acc, ms) {
   if (acc.consecutiveFails >= POOL.breakerThreshold) {
     // 连败降权：30m 起每次翻倍封顶 6h（参考 workbuddy2api breaker 指数退避）
     const blows = acc.consecutiveFails - POOL.breakerThreshold + 1;
-    const cd = Math.min(POOL.breakerCooldownMs * 2 ** (blows - 1), 6 * 3600_000);
+    const cd = Math.min(POOL.breakerCooldownMin * 60000 * 2 ** (blows - 1), 6 * 3600_000);
     acc.degradeUntil = Date.now() + cd;
     log(`[${acc.label}] 连败 ${acc.consecutiveFails} 次，降权 ${Math.round(cd / 60000)}min 至 ${new Date(acc.degradeUntil).toISOString()}`);
   }
@@ -1682,6 +1690,44 @@ async function refreshAccountEligibility(acc) {
   try { return await run; } finally { accountRefreshes.delete(key); }
 }
 
+/** Reauthorization refreshes with the new credentials after older lookups finish. */
+function refreshAfterAuthorization(acc) {
+  const label = acc.label;
+  const pending = [onboardRefreshes.get(label), ...['billing', 'coding', 'activation', 'eligibility', 'manual-refresh']
+    .map((kind) => accountRefreshes.get(`${label}:${kind}`))].filter(Boolean);
+  eligibilityCache.delete(label);
+  const run = (async () => {
+    await Promise.allSettled(pending);
+    let current = accounts.find((a) => a.label === label);
+    if (!current) return;
+    if (current.zaiAccessToken) {
+      const token = current.zaiAccessToken;
+      const profile = await fetchCustomerInfo(token);
+      // Re-read after the network wait so concurrent edits/new authorizations survive.
+      const records = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+      const record = records.find((a) => a.label === label && a.jwt === current.jwt && a.zaiAccessToken === token);
+      if (record && mergeCustomerInfo(record, profile)) {
+        fs.writeFileSync(ACC_FILE, JSON.stringify(records, null, 2));
+        const live = accounts.find((a) => a.label === label && a.jwt === record.jwt);
+        if (live) { mergeCustomerInfo(live, profile); live.identity = displayIdentity(live); }
+      }
+      current = accounts.find((a) => a.label === label);
+      if (!current) return;
+    }
+    activationCache.delete(label);
+    eligibilityCache.delete(label);
+    pendingClaims.delete(label);
+    return refreshAccountEligibility(current);
+  })().catch(() => {
+    eligibilityCache.set(label, { status: 'error', plans: [], currentPlans: [], checkedAt: new Date().toISOString(),
+      error: '授权已保存，但资格刷新未完成，请点击刷新资格与额度重试' });
+    log(`[${label}] 授权后资格刷新失败`);
+  }).finally(() => {
+    if (onboardRefreshes.get(label) === run) onboardRefreshes.delete(label);
+  });
+  onboardRefreshes.set(label, run);
+}
+
 async function refreshEligibility(acc, version) {
   const key = `${acc.label}:eligibility`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
@@ -1984,9 +2030,7 @@ async function handleOnboardStart(req, res) {
 }
 
 /**
- * 轮询上游授权状态，ready 时完成入库/领额度。
- * 返回 { http, body } 由调用方 sendJson —— 永远快速返回 JSON，绝不悬挂，
- * 否则反代（nginx 默认 60s read_timeout）会先吐 HTML 502，面板只能看到笼统报错。
+ * 授权成功后先保存凭证并返回，资格激活与额度查询在后台继续。
  */
 async function pollOnboardFlow(flowId, flow) {
   let j;
@@ -2008,26 +2052,23 @@ async function pollOnboardFlow(flowId, flow) {
   const st = j.data?.status;
   if (st !== 'ready') return { http: 200, body: { status: st || 'pending' } };
 
-  // 授权完成：拿 JWT + OAuth access_token → 入库 → 查真实身份 → 立即领取 → 回读余额
+  // 授权完成：保存 JWT、OAuth access_token 和授权身份，再异步刷新资格与额度。
   const jwt = j.data.token;
   const uid = userIdFromJwt(jwt);
+  if (!uid) return { http: 502, body: { error: '授权服务未返回有效账号凭证，请重新授权', code: 'invalid_credentials' } };
   const user = j.data.user ?? {};
   // ★ 关键：官方客户端就是从 data.zai.access_token 拿的（zai adapter），以前被我们丢掉了
   const accessToken = j.data.zai?.access_token || j.data.zai?.accessToken || null;
 
-  // 先用官方客户档案查真实邮箱/手机号 → 国内/国际自动判定
-  let customer = null;
-  if (accessToken) customer = await fetchCustomerInfo(accessToken);
-
-  let email = String(customer?.email || user.email || '').trim() || null;
-  let phone = String(customer?.phoneNumber || '').trim() || null;
-  let realm = realmFromCustomer(customer);
-  if (realm === 'unknown') realm = realmFromIdentity(email);
-  const nick = String(customer?.nickName || customer?.customerName || user.name || '').trim() || null;
+  // Detailed customer lookup runs in the background so a ready poll stays short.
+  const email = String(user.email || '').trim() || null;
+  const phone = String(user.phoneNumber || '').trim() || null;
+  const realm = realmFromIdentity(email) !== 'unknown' ? realmFromIdentity(email) : flow.provider === 'bigmodel' ? 'cn' : 'intl';
+  const nick = String(user.name || '').trim() || null;
   const label = nick ? `${nick}-${uid.slice(0, 8)}` : uid.slice(0, 8);
 
   const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken,
-    activationUserId: profileUserId(user) || profileUserId(customer) });
+    activationUserId: profileUserId(user) });
   pendingFlows.delete(flowId);
   writeFlows(pendingFlows);
   log(
@@ -2038,19 +2079,7 @@ async function pollOnboardFlow(flowId, flow) {
   accounts = readAccountFile();
   const acc = accounts.find((a) => a.uid === uid);
 
-  let claim = null;
-  let quota = null;
-  if (acc) {
-    // 并行跑且各自有超时：串行最坏 40s+，叠加 nginx 60s 就会 502 —— 那时账号其实已入库
-    try {
-      [claim, quota] = await Promise.all([
-        claimFor(acc).catch((e) => ({ ok: false, msg: e.message })),
-        quotaOf(acc).catch((e) => null),
-      ]);
-    } catch (e) {
-      claim = { ok: false, msg: e.message };
-    }
-  }
+  if (acc) refreshAfterAuthorization(acc);
 
   return {
     http: 200,
@@ -2064,8 +2093,9 @@ async function pollOnboardFlow(flowId, flow) {
       identity: acc?.identity ?? displayIdentity({ email, phone }),
       realm: acc?.realm ?? realm,
       hasAccessToken: acc?.hasAccessToken ?? !!accessToken,
-      claim,
-      quota,
+      claim: { ok: false, code: 'captcha_required', msg: '资格与额度正在自动刷新；领取套餐需查看详情并完成验证' },
+      quota: null,
+      eligibilityRefreshing: !!acc,
     },
   };
 }
@@ -2181,11 +2211,16 @@ async function handleAccountUpdate(req, res) {
   });
 }
 
-/** 面板自检：不经过对外密钥鉴权，直接拿一个可用账号打一次小请求 */
-async function handleSelfTest(req, res) {
-  const acc = accounts.find((a) => a.available) || accounts[0];
-  if (!acc) return sendJson(res, 503, { ok: false, error: '没有可用账号' });
+const selfTests = new Map();
+const SELFTEST_TIMEOUT_MS = Math.min(60000, Math.max(100, Number(process.env.ZCGW_SELFTEST_TIMEOUT_MS) || 45000));
+
+/** One inference attempt; transport, HTTP and payload failures are distinct. */
+async function probeAccount(acc) {
   const started = Date.now();
+  const identity = acc.jwt;
+  let upstreamStatus = null;
+  let rayId = null;
+  const failure = (code, message) => Object.assign(new Error(message), { probeCode: code });
   try {
     const body = buildUpstreamBody(
       { model: DEFAULT_MODEL, max_tokens: 64, messages: [{ role: 'user', content: '请只回复两个字：正常' }] },
@@ -2196,19 +2231,53 @@ async function handleSelfTest(req, res) {
       method: 'POST',
       headers: upstreamHeaders(acc),
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(SELFTEST_TIMEOUT_MS),
     });
+    upstreamStatus = r.status;
+    const ray = r.headers.get('cf-ray') || '';
+    if (/^[a-f\d]{12,32}(?:-[a-z]{3})?$/i.test(ray)) rayId = ray;
     const j = await safeJson(r);
-    if (j.code && j.code !== 0) {
-      return sendJson(res, 502, { ok: false, error: `${j.code} ${j.msg || ''}`, account: acc.label });
+    const rawCode = j?.error?.biz_code ?? j?.biz_code ?? j?.code;
+    const code = rawCode != null && /^[\w.-]{1,60}$/.test(String(rawCode)) ? String(rawCode) : null;
+    if (!r.ok) throw failure('upstream_http', `上游返回 HTTP ${r.status}${code ? `，业务码 ${code}` : ''}`);
+    if (!j || j.__error || Array.isArray(j)) throw failure('invalid_response', '上游返回了空响应或非 JSON 数据');
+    if (j.error || j.type === 'error' || (code && code !== '0')) {
+      throw failure('upstream_rejected', `上游拒绝了探测请求${code ? `（业务码 ${code}）` : ''}`);
     }
-    const txt = (j.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('').trim();
-    markSuccess(acc);
-    return sendJson(res, 200, { ok: true, account: acc.label, text: txt, ms: Date.now() - started });
+    const txt = Array.isArray(j.content) ? j.content.filter((c) => c?.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('').trim() : '';
+    if (!txt) throw failure('empty_reply', '上游未返回有效文本，无法确认探测成功');
+    const current = accounts.find((a) => a.label === acc.label && a.jwt === identity);
+    if (current) { current.cooldownUntil = 0; current.degradeUntil = 0; markSuccess(current); }
+    return { ok: true, account: acc.label, text: txt.slice(0, 500), ms: Date.now() - started, upstreamStatus };
   } catch (e) {
-    markFailure(acc, 60_000);
-    return sendJson(res, 502, { ok: false, error: e.message, account: acc.label });
+    const code = e.probeCode || (e.name === 'TimeoutError' || e.name === 'AbortError' ? 'timeout' : 'connection_failed');
+    const error = e.probeCode ? e.message : code === 'timeout'
+      ? `上游探测超时（${SELFTEST_TIMEOUT_MS / 1000} 秒），请稍后重试`
+      : '网关无法连接上游，或上游连接中断；请检查服务器到 ZCode 的网络';
+    const current = accounts.find((a) => a.label === acc.label && a.jwt === identity);
+    if (current) { current.lastErr = error; markFailure(current, 60_000); }
+    log(`[${acc.label}] selftest ${code} HTTP=${upstreamStatus ?? '-'} ms=${Date.now() - started}${rayId ? ` ray=${rayId}` : ''}`);
+    return { ok: false, account: acc.label, error, code, ms: Date.now() - started, upstreamStatus, rayId };
   }
+}
+
+function startSelfTest(acc) {
+  const previous = selfTests.get(acc.label);
+  if (previous?.status === 'running' && previous.identity === acc.jwt) return previous;
+  const job = { jobId: crypto.randomUUID(), identity: acc.jwt, status: 'running', result: null, expiresAt: Date.now() + 5 * 60_000 };
+  selfTests.set(acc.label, job);
+  void probeAccount(acc).then((result) => { job.result = result; }).catch(() => {
+    job.result = { ok: false, account: acc.label, code: 'internal_error', error: '探测未能完成，请检查网关日志' };
+  }).finally(() => { job.status = 'completed'; job.expiresAt = Date.now() + 5 * 60_000; });
+  return job;
+}
+const publicSelfTest = (job) => ({ jobId: job.jobId, status: job.status, result: job.result });
+
+/** Legacy endpoint keeps its direct-result contract. */
+async function handleSelfTest(req, res) {
+  const acc = accounts.find((a) => !a.disabled);
+  if (!acc) return sendJson(res, 409, { ok: false, error: '没有启用的账号' });
+  return sendJson(res, 200, await probeAccount(acc));
 }
 
 // ── 密钥 / 用量接口 ──
@@ -2628,6 +2697,7 @@ function buildOverview() {
         id, name: sourceName(a, id), status: 'pending', plans: [], syncedAt: null, error: null,
       }),
       eligibility: eligibilityCache.get(a.label) || null,
+      eligibilityRefreshing: onboardRefreshes.has(a.label),
       hasCodingPlanKey: !!a.codingPlanApiKey,
       codingPlanProvider: a.codingPlanProvider || (a.realm === 'cn' ? 'bigmodel' : 'zai'),
       plans: (quotaCache.get(a.label)?.plans || []).filter((p) => p.status === 'active'),
@@ -2780,6 +2850,14 @@ async function handleConsoleApi(req, res, url) {
     if (!GATEWAY_KEY) return sendJson(res, 404, { error: '未设置 GATEWAY_KEY（当前为开放模式，无需密钥）' });
     return sendJson(res, 200, { key: GATEWAY_KEY });
   }
+  const probeResult = p.match(/^\/api\/accounts\/(.+?)\/selftest\/([\w-]+)$/);
+  if (probeResult && req.method === 'GET') {
+    const id = decodeURIComponent(probeResult[1]);
+    const job = selfTests.get(id);
+    if (!accounts.some((a) => a.label === id)) return sendJson(res, 404, { error: '找不到账号' });
+    if (!job || job.jobId !== probeResult[2] || job.expiresAt <= Date.now()) return sendJson(res, 410, { error: '探测结果已过期或网关已重启，请重新探测' });
+    return sendJson(res, 200, publicSelfTest(job));
+  }
   // PATCH /api/accounts/:id —— 启用停用 + 身份字段
   const mAcc = p.match(/^\/api\/accounts\/(.+?)(?:\/(selftest|claim\/start|claim|refresh))?$/);
   if (mAcc) {
@@ -2788,34 +2866,14 @@ async function handleConsoleApi(req, res, url) {
     if (sub === 'refresh' && req.method === 'POST') {
       const acc = accounts.find((a) => a.label === id);
       if (!acc) return sendJson(res, 404, { error: '找不到账号' });
-      return sendJson(res, 200, await refreshAccountEligibility(acc));
+      const result = await (onboardRefreshes.get(id) || refreshAccountEligibility(acc));
+      return sendJson(res, 200, result || { quotaSources: Object.values(quotaSources.get(id) || {}), eligibility: eligibilityCache.get(id) });
     }
     if (sub === 'selftest' && req.method === 'POST') {
       const acc = accounts.find((a) => a.label === id);
       if (!acc) return sendJson(res, 404, { ok: false, error: `找不到账号 ${id}` });
-      if (acc.disabled) return sendJson(res, 502, { ok: false, error: '账号已停用', account: id });
-      const started = Date.now();
-      try {
-        const body = buildUpstreamBody(
-          { model: DEFAULT_MODEL, max_tokens: 64, messages: [{ role: 'user', content: '请只回复两个字：正常' }] },
-          acc,
-        );
-        body.stream = false;
-        const r = await fetch(UPSTREAM_URL, {
-          method: 'POST',
-          headers: upstreamHeaders(acc),
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(60000),
-        });
-        const j = await safeJson(r);
-        if (j.code && j.code !== 0) return sendJson(res, 502, { ok: false, error: `${j.code} ${j.msg || ''}`, account: id });
-        const txt = (j.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('').trim();
-        markSuccess(acc);
-        return sendJson(res, 200, { ok: true, account: id, text: txt, ms: Date.now() - started });
-      } catch (e) {
-        markFailure(acc, 60_000);
-        return sendJson(res, 502, { ok: false, error: e.message, account: id });
-      }
+      if (acc.disabled) return sendJson(res, 409, { ok: false, error: '账号已停用，请先启用再探测', account: id });
+      return sendJson(res, 202, publicSelfTest(startSelfTest(acc)));
     }
     if (sub === 'claim/start' && req.method === 'POST') {
       const acc = accounts.find((a) => a.label === id);

@@ -58,7 +58,6 @@ const detailsAccountId = ref<string | null>(null)
 const detailsPlanId = ref<string>()
 const detailsAccount = computed(() => accounts.value.find((a) => a.id === detailsAccountId.value) ?? null)
 const showOnboard = ref(false)
-const onboardProvider = ref<'zai' | 'bigmodel' | null>(null)
 const page = ref(1)
 const sortBy = ref<'created' | 'name'>('created')
 const groups = computed(() => [...new Set(accounts.value.map((a) => a.group))])
@@ -152,16 +151,9 @@ function edit(account: Account | null = null) {
   showEditor.value = true
   managingId.value = null
 }
-function startOnboard(provider: 'zai' | 'bigmodel') {
-  onboardProvider.value = provider
+function startOnboard() {
   showOnboard.value = true
   managingId.value = null
-}
-/** 按池内账号归属预选授权链：国内号在 chat.z.ai 登录页是走不通的。 */
-function preferred(): 'zai' | 'bigmodel' {
-  const cn = accounts.value.filter((a) => a.realm === 'cn').length
-  const intl = accounts.value.filter((a) => a.realm === 'intl').length
-  return cn >= intl ? 'bigmodel' : 'zai'
 }
 function toggleAll() {
   if (allSelected.value) rows.value.forEach((a) => selected.value.delete(a.id))
@@ -211,11 +203,7 @@ async function batch(enabled: boolean) {
         <RefreshCw :size="15" :class="{ spin: !!refreshProgress }" />
         {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '一键刷新资格' }}
       </button>
-      <button class="button" @click="startOnboard('zai')">
-        <Cloud :size="15" />登录国际账号</button
-      ><button class="button" @click="startOnboard('bigmodel')">
-        <Cloud :size="15" />登录国内账号</button
-      ><button class="button primary" @click="startOnboard(preferred())"
+      <button class="button primary" @click="startOnboard()"
         ><Plus :size="17" />登录新账号</button
       >
     </div>
@@ -429,7 +417,8 @@ async function batch(enabled: boolean) {
                   @click="refreshQualifications([account.id])">
                   <RefreshCw :size="12" :class="{ spin: refreshingAccounts.has(account.id) }" />刷新资格与额度
                 </button>
-                <span v-if="!account.eligibility" class="quota-sync-state">领取资格尚未查询</span>
+                <span v-if="account.eligibilityRefreshing" class="quota-sync-state" role="status">授权已更新，正在自动刷新资格与额度…</span>
+                <span v-else-if="!account.eligibility" class="quota-sync-state">领取资格尚未查询</span>
                 <template v-else>
                   <span v-if="account.eligibility.activation?.error" class="quota-sync-state error">{{ account.eligibility.activation.error }}</span>
                   <span v-else-if="account.eligibility.activation?.status === 'ready'" class="quota-updated">资格激活上报已完成</span>
@@ -542,7 +531,7 @@ async function batch(enabled: boolean) {
           class="desktop-only"
         />网关自动管理账号与请求分配。
       </p>
-      <button class="button primary" @click="startOnboard(preferred())"><Plus :size="16" />登录第一个账号</button>
+      <button class="button primary" @click="startOnboard()"><Plus :size="16" />登录第一个账号</button>
       <div class="empty-steps">
         <span><b>1</b>登录授权</span><ArrowRight :size="13" /><span><b>2</b>查看套餐并领取</span
         ><ArrowRight :size="13" /><span><b>3</b>统一 API 调用</span>
@@ -597,7 +586,6 @@ async function batch(enabled: boolean) {
   />
   <OnboardDialog
     v-if="showOnboard"
-    :initial-provider="onboardProvider"
     @close="showOnboard = false"
   />
   <ModalShell
@@ -630,9 +618,9 @@ async function batch(enabled: boolean) {
       >
         <Activity :size="19" /><strong>连通自检</strong
         ><small>真实调用一次上游推理</small></button
-      ><button @click="startOnboard(managing.realm === 'cn' ? 'bigmodel' : 'zai')">
+      ><button @click="startOnboard()">
         <Cloud :size="19" /><strong>重新登录授权</strong
-        ><small>刷新 OAuth access_token 并自动识别身份</small></button
+        ><small>更新授权并自动刷新资格与额度</small></button
       >
     </div></ModalShell
   >

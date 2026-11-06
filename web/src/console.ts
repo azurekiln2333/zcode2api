@@ -2,7 +2,7 @@ import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
 import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
 import { visibleQuotaSources } from './quota'
-import type { Account, AccountRefresh, ClaimPlan, ClaimResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings } from './types'
+import type { Account, AccountRefresh, ClaimPlan, ClaimResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings, SelfTestJob } from './types'
 
 const overview = ref<Overview | null>(null)
 const logs = ref<LogEntry[]>([])
@@ -42,6 +42,7 @@ function reset() {
   refreshPromise = null
   refreshingAccounts.value.clear()
   refreshProgress.value = null
+  busy.value.clear()
   delete logsRequests.requests
   logQueries.requests.value = emptyLogQuery()
   logPages.requests.value = { total: 0, loading: false }
@@ -154,17 +155,26 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
   busy.value.add(id)
   if (operation === 'quota') activeClaimAccount = id
   const generation = claimGeneration
+  const session = sessionGeneration
   try {
     if (operation === 'probe') {
-      const result = await api<{ ok: boolean; account?: string; text?: string; ms?: number; error?: string }>(
-        `/accounts/${encodeURIComponent(id)}/selftest`,
-        'POST',
-        {},
-      )
+      const path = `/accounts/${encodeURIComponent(id)}/selftest`
+      let job = await api<SelfTestJob>(path, 'POST', {})
+      const deadline = Date.now() + 75000
+      while (job.status === 'running') {
+        if (session !== sessionGeneration) return
+        if (Date.now() >= deadline) throw new Error('探测结果等待超时，请稍后查看账号状态')
+        await new Promise((resolve) => window.setTimeout(resolve, 1000))
+        if (session !== sessionGeneration) return
+        job = await api<SelfTestJob>(`${path}/${encodeURIComponent(job.jobId)}`)
+      }
+      if (session !== sessionGeneration) return
+      const result = job.result
+      if (!result) throw new Error('探测未返回结果，请稍后重试')
       notify(
         result.ok
           ? `自检通过：${result.account ?? '账号'} 回复「${result.text || '正常'}」（${result.ms ?? '—'} ms）`
-          : result.error || '自检请求未通过',
+          : `${result.error || '自检请求未通过'}${result.rayId ? ` · 上游 Ray ID ${result.rayId}` : ''}`,
         !result.ok,
       )
     } else {
@@ -189,6 +199,7 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
     }
     await refresh()
   } catch (error) {
+    if (session !== sessionGeneration) return
     if (operation === 'quota') cancelCaptcha()
     if (operation === 'quota' && generation !== claimGeneration) return
     notify(
@@ -197,8 +208,33 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
       error instanceof ApiError ? error.diagnostics : undefined,
     )
   } finally {
-    busy.value.delete(id)
+    if (session === sessionGeneration) busy.value.delete(id)
     if (operation === 'quota') activeClaimAccount = null
+  }
+}
+
+/** Observe the server's automatic refresh even after the login dialog closes. */
+async function syncAuthorizedAccount(id: string) {
+  const generation = sessionGeneration
+  const deadline = Date.now() + 150000
+  while (generation === sessionGeneration) {
+    if (refreshPromise) await refreshPromise
+    if (generation !== sessionGeneration) return
+    await refresh()
+    if (generation !== sessionGeneration) return
+    const account = overview.value?.accounts.find((a) => a.id === id)
+    if (!refreshError.value && account && !account.eligibilityRefreshing) {
+      const state = account.eligibility
+      const failed = !state || state.status !== 'ready' || !!state.activation?.error || !!state.currentError
+        || visibleQuotaSources(account.quotaSources).some((s) => s.status === 'error')
+      notify(failed ? '授权已更新，资格或额度查询有异常，请查看账号提示' : '授权已更新，资格与额度已自动刷新', failed)
+      return
+    }
+    if (Date.now() >= deadline) {
+      notify('授权已保存，资格与额度仍在刷新，请稍后查看账号状态')
+      return
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1000))
   }
 }
 
@@ -376,6 +412,7 @@ export function useConsole() {
     refreshingAccounts,
     refreshProgress,
     refreshQualifications,
+    syncAuthorizedAccount,
     toasts,
     registration,
     accounts: computed(() => overview.value?.accounts ?? []),

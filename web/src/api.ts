@@ -108,11 +108,11 @@ function diagnose(
     source = 'cloudflare'
     hint =
       response.status >= 500
-        ? 'Cloudflare 错误响应，请检查 Cloudflare → 源站链路、Nginx 和面板日志；此响应无法确认 CNB 请求结果。'
+        ? 'Cloudflare 错误响应，请检查 Cloudflare → 源站链路、Nginx 和网关日志；此响应无法确认 ZCode 上游请求结果。'
         : 'Cloudflare 错误响应，请检查边缘访问规则、Cloudflare 事件和源站日志。'
   } else if (nginx) {
     source = 'nginx'
-    hint = 'Nginx 返回 HTML 错误页，请检查反向代理到面板服务的连接；此页无法确认 CNB 请求结果。'
+    hint = 'Nginx 返回 HTML 错误页，请检查反向代理到网关服务的连接；此页无法确认 ZCode 上游请求结果。'
   } else if (source === 'json-api') {
     hint = '管理接口返回 JSON 错误，请结合面板日志确认具体原因。'
   } else if (viaCloudflare) {

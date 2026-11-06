@@ -20,6 +20,10 @@ test('console API client completes both OAuth flows through the production route
   let initFailure = false;
   let pollExpired = false;
   let oauthCalls = 0;
+  let slowProfile;
+  let profileStarted = false;
+  let profileGate;
+  let profileRequests = 0;
   const upstream = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const send = (data, code = 0, status = 200) => {
@@ -44,7 +48,8 @@ test('console API client completes both OAuth flows through the production route
       const flow = flows.get(id);
       if (!flow || req.headers.authorization !== flow.pollToken) return send(null, 3004, 410);
       return send(flow.ready
-        ? { status: 'ready', token: jwt(id), user: { user_id: `profile:${id}`, name: 'OAuth user' } }
+        ? { status: 'ready', token: flow.token || jwt(id), user: { user_id: `profile:${id}`, name: 'OAuth user' },
+          ...(slowProfile ? { zai: { access_token: 'test-slow-profile' } } : {}) }
         : { status: 'pending' });
     }
     const callback = url.pathname.match(/\/oauth\/cli\/callback\/(zai|bigmodel)$/);
@@ -57,6 +62,16 @@ test('console API client completes both OAuth flows through the production route
       return send({ ok: true });
     }
     if (url.pathname.endsWith('/billing/balance')) return send({ plans: [], balances: [] });
+    if (url.pathname.endsWith('/customer/getCustomerInfo')) {
+      profileStarted = true;
+      profileRequests++;
+      if (profileGate) await profileGate;
+      await slowProfile;
+      return send({ email: 'oauth@example.invalid', id: 'customer-profile' }, 200);
+    }
+    if (url.pathname.endsWith('/event/report')) return send({});
+    if (/\/billing\/(preview|current)$/.test(url.pathname)) return send({ plans: [] });
+    if (url.pathname.endsWith('/marketing/touch')) return send({ deliveries: [] });
     return send(null, 404, 404);
   });
   upstream.listen(0, '127.0.0.1');
@@ -157,6 +172,33 @@ test('console API client completes both OAuth flows through the production route
     assert.ok((await api('/overview')).accounts.some((a) => a.id === result.label));
   });
 
+  await t.test('a slow customer lookup cannot hold the ready response or consume the flow before the browser gets it', async () => {
+    let releaseProfile;
+    slowProfile = new Promise((resolve) => { releaseProfile = resolve; });
+    try {
+      const flow = await api('/onboard/start', 'POST', { provider: 'zai' });
+      flows.get(flow.flowId).ready = true;
+      const result = await Promise.race([
+        api(`/onboard/poll/${encodeURIComponent(flow.flowId)}`),
+        delay(1000).then(() => { throw new Error('ready response waited for customer lookup'); }),
+      ]);
+      assert.equal(result.status, 'ready');
+      assert.equal(result.eligibilityRefreshing, true);
+      for (let i = 0; i < 100 && !profileStarted; i++) await delay(10);
+      assert.ok(profileStarted);
+      releaseProfile();
+      let account;
+      for (let i = 0; i < 100; i++) {
+        account = (await api('/overview')).accounts.find((a) => a.id === result.label);
+        if (!account.eligibilityRefreshing) break;
+        await delay(10);
+      }
+      assert.equal(account.eligibilityRefreshing, false);
+      assert.equal(account.eligibility.activation.status, 'ready');
+      assert.equal(account.email, 'oauth@example.invalid');
+    } finally { releaseProfile(); slowProfile = null; }
+  });
+
   await t.test('upstream failures and expired flows preserve actionable error messages', async () => {
     initFailure = true;
     await assert.rejects(api('/onboard/start', 'POST', { provider: 'zai' }),
@@ -170,6 +212,38 @@ test('console API client completes both OAuth flows through the production route
     await assert.rejects(api('/onboard/redeem', 'POST', { flowId: 'unknown-flow' }),
       (error) => error.status === 410 && /没有匹配的授权流程/.test(error.message));
     assert.ok(clientRequests.every((req) => req.path.startsWith('/api/')));
+  });
+
+  await t.test('a profile lookup started before reauthorization cannot overwrite the renewed credentials', async () => {
+    let release;
+    profileGate = new Promise((resolve) => { release = resolve; });
+    slowProfile = Promise.resolve();
+    const before = profileRequests;
+    try {
+      const first = await api('/onboard/start', 'POST', { provider: 'zai' });
+      flows.get(first.flowId).ready = true;
+      const added = await api(`/onboard/poll/${encodeURIComponent(first.flowId)}`);
+      for (let i = 0; i < 100 && profileRequests === before; i++) await delay(10);
+      assert.ok(profileRequests > before);
+      const second = await api('/onboard/start', 'POST', { provider: 'zai' });
+      const renewed = jwt(first.flowId) + '-renewed';
+      Object.assign(flows.get(second.flowId), { ready: true, token: renewed });
+      const loggedIn = await api(`/onboard/poll/${encodeURIComponent(second.flowId)}`);
+      assert.equal(loggedIn.added, false);
+      assert.equal(loggedIn.label, added.label);
+      release();
+      let account;
+      for (let i = 0; i < 150; i++) {
+        account = (await api('/overview')).accounts.find((a) => a.id === added.label);
+        if (!account.eligibilityRefreshing) break;
+        await delay(10);
+      }
+      assert.equal(account.eligibilityRefreshing, false);
+      assert.equal(account.eligibility.activation.status, 'ready');
+      const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+      assert.equal(saved.find((a) => a.label === added.label).jwt, renewed);
+      assert.equal(saved.find((a) => a.label === added.label).activationUserId, `profile:${second.flowId}`);
+    } finally { release(); profileGate = null; slowProfile = null; }
   });
 
   await t.test('legacy root onboarding routes remain compatible', async () => {
