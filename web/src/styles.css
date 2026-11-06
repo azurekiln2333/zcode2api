@@ -1363,9 +1363,6 @@ button.button,
 .quota-cell .quota-sync-state { max-width: none; overflow-wrap: anywhere; }
 .quota-details + .eligibility-status { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
 .eligibility-status .text-link { display: flex; margin-top: 6px; text-align: left; white-space: normal; }
-.overview-quota-list { max-height: 340px; overflow: auto; margin-top: 16px; }
-.overview-quota-list > details { border-top: 1px solid var(--line); padding: 10px 0; }
-.overview-quota-list summary { cursor: pointer; font-size: 13px; margin-bottom: 8px; }
 .quota-sync-state {
   display: block;
   margin-top: 4px;

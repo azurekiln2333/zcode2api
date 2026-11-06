@@ -429,7 +429,7 @@ onBeforeUnmount(() => {
         </div>
         <template v-else-if="overview"
           ><AccountsView v-if="page === 'accounts'" @navigate="navigate" /><OverviewView
-            v-else-if="page === 'overview'" /><RoutingView v-else-if="page === 'routing'"
+            v-else-if="page === 'overview'" @navigate="navigate" /><RoutingView v-else-if="page === 'routing'"
           /><AccessView v-else
         /></template>
         <div v-else-if="!refreshError" class="page-loading">等待网关数据</div>

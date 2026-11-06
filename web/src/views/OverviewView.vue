@@ -8,21 +8,25 @@ import {
   UsersRound,
   Radio,
   ArrowRight,
+  RefreshCw,
   Coins,
   Wallet,
 } from '@lucide/vue'
 import { number, compact, useConsole, accountState, time } from '../console'
 import { abbreviateCount } from '../format'
-import { summarizeQuota, visibleQuotaSources } from '../quota'
+import { summarizeQuota } from '../quota'
+import { summarizeOverviewQuota } from '../overview-quota'
 import type { TokenTotals } from '../types'
-import QuotaDetails from '../components/QuotaDetails.vue'
+import AccountQuotaCard from '../components/AccountQuotaCard.vue'
 const emit = defineEmits<{ navigate: [page: 'accounts'] }>()
 const { overview, accounts, lastUpdated, refreshQualifications, refreshProgress } = useConsole()
 const tokenPeriod = ref<'today' | 'total'>('today')
 const credits = computed(() => summarizeQuota(accounts.value))
-const quotaAccounts = computed(() => accounts.value.filter((account) =>
-  visibleQuotaSources(account.quotaSources || []).length > 0,
-))
+const quotaAccounts = computed(() => accounts.value.map((account) => ({
+  account, quota: summarizeOverviewQuota(account.quotaSources || []),
+})))
+const poolQuota = computed(() => summarizeOverviewQuota(accounts.value.flatMap((account) => account.quotaSources || [])))
+const short = (value: number | null) => value === null ? '—' : abbreviateCount(value) || number(value, 1)
 const tokens = computed(() => overview.value?.stats.tokenUsage?.[tokenPeriod.value])
 const todayTokens = computed(() => overview.value?.stats.tokenUsage?.today)
 const tokenNumber = (usage: TokenTotals | null | undefined, key: keyof TokenTotals) =>
@@ -37,8 +41,9 @@ const tokenSummaryStatus = computed(() => {
   return `${number(usage.reportedRequests)} 次请求已计入统计。`
 })
 const creditSummaryStatus = computed(() => {
+  if (poolQuota.value.stale) return '部分账号更新失败，当前显示上次额度。'
   if (!credits.value.organizations) return '点击刷新资格，读取各账号的套餐额度。'
-  return `已读取 ${credits.value.organizations} 个账号的套餐额度 · 后台每 10 分钟查询`
+  return `已查询 ${credits.value.organizations} 个账号 · ${poolQuota.value.plans} 个套餐`
 })
 const tokenMetrics = [
   { key: 'input', label: '输入 Tokens', hint: '包含缓存读取与写入' },
@@ -65,18 +70,6 @@ const points = computed(() =>
 const line = computed(() => `M${points.value.join(' L')}`)
 const area = computed(() => `${line.value} L847,205 L42,205 Z`)
 const chartHasData = computed(() => buckets.value.some((b) => b.requests > 0))
-const ranked = computed(() =>
-  accounts.value
-    .map((a) => ({
-      ...a,
-      today:
-        overview.value?.hourly
-          .filter((b) => Date.parse(b.at) >= today.value)
-          .reduce((n, b) => n + (b.accounts[a.id] || 0), 0) ?? 0,
-    }))
-    .sort((a, b) => b.today - a.today)
-    .slice(0, 5),
-)
 const states = computed(() => [
   {
     label: '可用',
@@ -153,23 +146,30 @@ const states = computed(() => [
       aria-labelledby="overview-credits-summary-heading"
     >
       <div class="stat-top">
-        <h2 id="overview-credits-summary-heading">账号剩余额度</h2>
+        <h2 id="overview-credits-summary-heading">{{ poolQuota.mode === 'percent' ? '综合剩余额度' : '剩余总额度' }}</h2>
         <span class="stat-icon amber"><Wallet :size="19" /></span>
       </div>
       <div class="overview-summary-value">
-        <strong>{{ credits.plans }}</strong><span>个套餐 · {{ credits.organizations }} 个账号</span>
+        <strong :title="poolQuota.mode === 'amount' ? number(poolQuota.remaining, 1) : undefined">{{
+          poolQuota.mode === 'amount' ? short(poolQuota.remaining) : poolQuota.percent === null ? '—' : number(poolQuota.percent, 1)
+        }}</strong>
+        <span>{{ poolQuota.mode === 'amount' ? poolQuota.unit : poolQuota.percent === null ? '' : '%' }}</span>
+        <span v-if="poolQuota.mode === 'amount' && poolQuota.percent !== null">剩余 {{ number(poolQuota.percent, 1) }}%</span>
       </div>
-      <button class="text-link" :disabled="!!refreshProgress || !accounts.length" @click="refreshQualifications()">
-        {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '刷新资格与额度' }}
-      </button>
-      <div v-if="quotaAccounts.length" class="overview-quota-list">
-        <details v-for="account in quotaAccounts" :key="account.id">
-          <summary>{{ account.name }}</summary>
-          <QuotaDetails :sources="account.quotaSources || []" />
-        </details>
-      </div>
-      <p class="overview-summary-state">{{ creditSummaryStatus }}</p>
-      <p class="overview-summary-note">{{ credits.errors ? `${credits.errors} 个来源查询失败，请查看账号明细` : '各来源、套餐、模型与周期分别展示' }}</p>
+      <dl class="overview-summary-breakdown">
+        <div>
+          <dt>{{ poolQuota.mode === 'percent' ? '额度项' : '已使用' }}</dt>
+          <dd :title="poolQuota.mode === 'amount' ? number(poolQuota.used, 1) : undefined">{{ poolQuota.mode === 'percent' ? poolQuota.items : short(poolQuota.used) }}</dd>
+        </div>
+        <div>
+          <dt>{{ poolQuota.mode === 'percent' ? '总套餐数' : poolQuota.partial ? '已知总额度' : '总额度' }}</dt>
+          <dd :title="poolQuota.mode === 'amount' ? number(poolQuota.total, 1) : undefined">{{ poolQuota.mode === 'percent' ? poolQuota.plans : short(poolQuota.total) }}</dd>
+        </div>
+        <div><dt>已查询账号</dt><dd>{{ credits.organizations }}</dd></div>
+        <div><dt>账号总数</dt><dd>{{ accounts.length }}</dd></div>
+      </dl>
+      <p class="overview-summary-state" :class="{ 'quota-error-text': poolQuota.stale }">{{ creditSummaryStatus }}</p>
+      <p class="overview-summary-note">{{ poolQuota.mode === 'percent' ? '综合比例为各额度项剩余比例的平均值' : poolQuota.partial ? '当前汇总已知额度，完整明细见账号管理' : '全部账号与套餐合计 · 后台每 10 分钟更新' }}</p>
     </section>
   </div>
   <div class="stats-grid">
@@ -355,4 +355,112 @@ const states = computed(() => [
       </button>
     </section>
   </div>
+  <section class="overview-account-quotas" aria-labelledby="account-quotas-heading">
+    <header class="account-quotas-heading">
+      <div>
+        <h2 id="account-quotas-heading">账号额度<span>{{ accounts.length }}</span></h2>
+        <p>每个账号汇总显示，套餐明细在账号管理中查看</p>
+      </div>
+      <div class="account-quota-actions">
+        <button class="button" :disabled="!!refreshProgress || !accounts.length" @click="refreshQualifications()">
+          <RefreshCw :size="14" :class="{ spin: !!refreshProgress }" />
+          {{ refreshProgress ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}` : '刷新资格与额度' }}
+        </button>
+        <button class="text-link" @click="emit('navigate', 'accounts')">管理账号<ArrowUpRight :size="14" /></button>
+      </div>
+    </header>
+    <div v-if="quotaAccounts.length" class="account-quota-grid">
+      <AccountQuotaCard v-for="({ account, quota }, index) in quotaAccounts" :key="account.id"
+        :account="account" :quota="quota" :index="index" @details="emit('navigate', 'accounts')" />
+    </div>
+    <div v-else class="account-quotas-empty">
+      <Wallet :size="22" /><span>添加账号后，在这里查看每个账号的总额度。</span>
+      <button class="text-link" @click="emit('navigate', 'accounts')">添加账号<ArrowRight :size="13" /></button>
+    </div>
+  </section>
 </template>
+
+<style scoped>
+.overview-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 13px;
+}
+.overview-summary-card {
+  min-width: 0;
+  padding: 12px 15px 11px;
+  border-top: 2px solid var(--primary);
+}
+.credits-summary-card { border-top-color: var(--amber); }
+.overview-summary-card h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+.overview-summary-value { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; margin: 6px 0 9px; }
+.overview-summary-value strong { font-size: 30px; line-height: 1.2; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.overview-summary-value > span { font-size: 12px; color: var(--muted); }
+.overview-summary-breakdown { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px 12px; margin: 0 0 8px; }
+.overview-summary-breakdown > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.overview-summary-breakdown dt { font-size: 12px; color: var(--secondary); }
+.overview-summary-breakdown dd { margin: 0; font-size: 14px; font-weight: 550; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.usage-short,
+.overview-summary-value > small { font-size: 11px; font-weight: 500; color: var(--secondary); font-variant-numeric: tabular-nums; }
+.token-metric > em.usage-short { font-style: normal; }
+.overview-summary-state { margin: 0; font-size: 12px; color: var(--secondary); line-height: 1.5; }
+.overview-summary-note { margin: 3px 0 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.overview-summary-state.quota-error-text { color: var(--amber); }
+.page-heading { align-items: flex-end; gap: 12px; margin-bottom: 14px; }
+.page-heading h1 { margin-top: 3px; margin-bottom: 2px; gap: 9px; font-size: 24px; letter-spacing: -.5px; }
+.page-heading .eyebrow { font-size: 11px; letter-spacing: 1.3px; }
+.page-heading > .button { min-height: 32px; padding: 6px 11px; font-size: 13px; }
+.stats-grid { gap: 10px; margin-bottom: 13px; }
+.stat-card { min-height: 0; padding: 12px 14px 11px; }
+.stat-top { font-size: 12px; }
+.stat-icon { width: 24px; height: 24px; }
+.stat-icon svg { width: 14px; }
+.stat-value { gap: 5px; margin-top: 4px; font-size: 24px; letter-spacing: -.7px; }
+.stat-bottom { gap: 5px; margin-top: 6px; }
+.section-panel { margin-bottom: 13px; }
+.chart-heading { padding: 13px 16px 9px; gap: 12px; }
+.chart-heading p { margin-top: 3px; line-height: 1.5; }
+.token-metrics { gap: 12px; padding: 2px 16px 13px; }
+.token-metric { gap: 5px; }
+.token-metric > span { font-size: 12px; }
+.token-metric > strong { font-size: clamp(20px, 1.7vw, 26px); }
+.token-metric > small { font-size: 12px; }
+.token-accounting-note { gap: 3px; padding: 9px 16px; font-size: 12px; line-height: 1.5; }
+.traffic-chart { padding: 6px 14px 0; min-height: 184px; }
+.traffic-chart > svg { min-height: 184px; }
+.chart-footer { padding: 9px 16px 13px; }
+.pool-health .health-number { font-size: 34px; padding: 6px 16px 10px; }
+.health-number small { font-size: 17px; }
+.health-number span { margin-top: 2px; }
+.health-distribution { margin: 0 16px 12px; }
+.health-legend { padding: 0 16px; gap: 8px 12px; }
+.pool-health > .text-link { margin: 12px 16px 13px; }
+.overview-main-grid { gap: 13px; }
+.overview-account-quotas { margin-top: 4px; }
+.account-quotas-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.account-quotas-heading h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; font-weight: 600; }
+.account-quotas-heading h2 > span { padding: 1px 7px; background: var(--primary-soft); color: var(--primary); border-radius: var(--radius-xs); font-size: 11px; }
+.account-quotas-heading p { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+.account-quota-actions { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+.account-quota-actions > .button { min-height: 32px; font-size: 12px; padding: 6px 10px; }
+.account-quota-actions > .text-link { font-size: 12px; }
+.account-quota-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr)); gap: 12px; }
+.account-quotas-empty { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; padding: 32px 16px; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); font-size: 13px; }
+@media (max-width: 900px) {
+  .overview-summary-breakdown { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+}
+@media (max-width: 600px) {
+  .overview-summary-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 12px; }
+  .page-heading { align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+  .page-heading > .button { padding: 6px 9px; font-size: 12px; }
+  .stat-card { padding: 11px 12px 10px; }
+  .stat-value { font-size: 22px; }
+  .overview-summary-value strong { font-size: 26px; }
+  .overview-summary-note { font-size: 11px; }
+  .account-quotas-heading { align-items: flex-start; flex-direction: column; }
+  .account-quota-actions { width: 100%; justify-content: space-between; }
+  .account-quota-grid { gap: 10px; }
+  .chart-heading { flex-wrap: wrap; }
+}
+</style>
