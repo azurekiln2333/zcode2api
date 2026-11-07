@@ -35,9 +35,42 @@ test('coding plan windows are distinct and percentage-only responses stay unknow
   assert.equal(plan.items.length, 3);
   assert.equal(plan.items[0].remaining, 60);
   assert.match(plan.items[0].name, /5 小时/);
-  assert.match(plan.items[1].name, /1 周/);
+  assert.equal(plan.items[1].name, '每周剩余');
   assert.equal(plan.items[1].remainingPercent, 75);
   assert.equal(plan.items[1].total, null);
   assert.equal(plan.items[1].remaining, null);
   assert.equal(plan.items[2].remainingPercent, null);
+});
+
+test('Coding Plan shows active subscription, percentage windows and independent MCP reset', () => {
+  const [plan] = normalizeCoding({ limits: [
+    { type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 0 },
+    { type: 'TOKENS_LIMIT', unit: 6, number: 1, percentage: 6, usage: 1000, currentValue: 0, nextResetTime: 1794355200000 },
+    { type: 'TIME_LIMIT', unit: 5, number: 1, percentage: 100 },
+  ] }, [
+    { productId: 'coding-old', productName: '旧套餐', status: 'EXPIRED' },
+    { productId: 'coding-trial', productName: 'GLM Coding Plan 优享体验卡', inCurrentPeriod: true, nextRenewTime: '2026-11-11T16:00:00Z' },
+  ], { server_time: 1794000000, next_refresh_at: 1794144000, total_usage: { limit: 500, used: 0, remaining: 500 } },
+  { label: '150% 配额', description: '活动说明' });
+  assert.equal(plan.name, 'GLM Coding Plan 优享体验卡');
+  assert.equal(plan.endsAt, '2026-11-11T16:00:00.000Z');
+  assert.deepEqual(plan.items.map((item) => [item.name, item.remainingPercent]), [
+    ['5 小时剩余', 100], ['每周剩余', 94], ['工具调用', 0], ['ZCode MCP', 100],
+  ]);
+  assert.equal(plan.items[0].total, null);
+  assert.equal(plan.items[3].total, 500);
+  assert.equal(plan.items[3].resetAt, new Date(1794144000000).toISOString());
+  assert.equal(plan.campaign.label, '150% 配额');
+});
+
+test('MCP zero, missing and invalid quotas are distinct; expiry supports valid date ranges', () => {
+  const subscription = [{ productName: '未来可以改名的套餐', status: 'VALID', valid: '2026-11-01 - 2026-11-11' }];
+  const [plan] = normalizeCoding({ limits: [] }, subscription, { total_usage: { limit: 100, remaining: 0 } });
+  assert.equal(plan.name, subscription[0].productName);
+  assert.equal(plan.endsAt, '2026-11-11T00:00:00.000Z');
+  assert.equal(plan.items[0].remainingPercent, 0);
+  assert.equal(normalizeCoding({ limits: [] }, subscription, { total_usage: { limit: 100, remaining: -1 } })[0].items[0].remainingPercent, 0);
+  for (const mcp of [null, {}, { total_usage: { limit: 0, remaining: 0 } }, { total_usage: { limit: -1, remaining: 0 } }]) {
+    assert.deepEqual(normalizeCoding({ limits: [] }, subscription, mcp), []);
+  }
 });

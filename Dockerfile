@@ -19,7 +19,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
 # 先拷程序（利用层缓存；数据卷挂 /app/data）
-COPY --chown=zcgw:zcgw package.json zcgw-server.mjs zcgw-fingerprint.mjs zcgw-quota.mjs zcgw-claim.mjs zcgw-upstream.mjs zcgw-version.mjs zcgw-auto-claim.mjs zcgw-captcha-browser.mjs THIRD_PARTY_NOTICES.md zcode-profile.json dashboard.html ./
+COPY --chown=zcgw:zcgw package.json zcgw-server.mjs zcgw-fingerprint.mjs zcgw-quota.mjs zcgw-coding.mjs zcgw-claim.mjs zcgw-upstream.mjs zcgw-version.mjs zcgw-auto-claim.mjs zcgw-captcha-browser.mjs THIRD_PARTY_NOTICES.md zcode-profile.json dashboard.html ./
 COPY --from=webbuild --chown=zcgw:zcgw /build/web/dist ./web/dist
 
 # 数据目录由 compose 挂载到宿主机 ./data（宿主机需 chown 100:101 给容器内 zcgw 用户）

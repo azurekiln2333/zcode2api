@@ -49,7 +49,7 @@ test('console API client completes both OAuth flows through the production route
       if (!flow || req.headers.authorization !== flow.pollToken) return send(null, 3004, 410);
       return send(flow.ready
         ? { status: 'ready', token: flow.token || jwt(id), user: { user_id: `profile:${id}`, name: 'OAuth user' },
-          ...(slowProfile ? { zai: { access_token: 'test-slow-profile' } } : {}) }
+          ...(flow.oauth || (slowProfile ? { zai: { access_token: 'test-slow-profile' } } : {})) }
         : { status: 'pending' });
     }
     const callback = url.pathname.match(/\/oauth\/cli\/callback\/(zai|bigmodel)$/);
@@ -62,6 +62,12 @@ test('console API client completes both OAuth flows through the production route
       return send({ ok: true });
     }
     if (url.pathname.endsWith('/billing/balance')) return send({ plans: [], balances: [] });
+    if (url.pathname === '/api/auth/z/login') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const { token } = JSON.parse(Buffer.concat(chunks));
+      return token === 'onboard-zai-raw' ? send({ access_token: 'onboard-zai-business' }, 200) : send(null, 401);
+    }
     if (url.pathname.endsWith('/customer/getCustomerInfo')) {
       profileStarted = true;
       profileRequests++;
@@ -69,6 +75,17 @@ test('console API client completes both OAuth flows through the production route
       await slowProfile;
       return send({ email: 'oauth@example.invalid', id: 'customer-profile' }, 200);
     }
+    if (url.pathname.endsWith('/quota/limit')) return send({ limits: [
+      { type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 0 },
+      { type: 'TOKENS_LIMIT', unit: 6, number: 1, percentage: 6 },
+    ] }, 200);
+    if (url.pathname.endsWith('/subscription/list')) return send([{
+      productId: 'trial-coding', productName: 'GLM Coding Plan 优享体验卡', status: 'VALID', inCurrentPeriod: true,
+      expireTime: '2026-11-11T15:59:59Z',
+    }], 200);
+    if (url.pathname.endsWith('/mcp/usage')) return send({ server_time: 1794000000, next_refresh_at: 1794144000,
+      total_usage: { used: 0, limit: 500, remaining: 500 } });
+    if (url.pathname.endsWith('/client/configs')) return send({ configs: {} });
     if (url.pathname.endsWith('/event/report')) return send({});
     if (/\/billing\/(preview|current)$/.test(url.pathname)) return send({ plans: [] });
     if (url.pathname.endsWith('/marketing/touch')) return send({ deliveries: [] });
@@ -140,6 +157,8 @@ test('console API client completes both OAuth flows through the production route
   for (const provider of ['zai', 'bigmodel']) {
     await t.test(`${provider}: start, pending poll, callback redemption and account persistence`, async () => {
       const flow = await api('/onboard/start', 'POST', { provider });
+      flows.get(flow.flowId).oauth = provider === 'zai'
+        ? { zai: { access_token: 'onboard-zai-raw' } } : { bigmodel: { accessToken: 'onboard-bigmodel-raw' } };
       assert.equal(flow.provider, provider);
       assert.ok(flow.authorizeUrl.startsWith('https://example.invalid/authorize?'));
       assert.ok(flow.expiresAt > Date.now() / 1000);
@@ -152,14 +171,31 @@ test('console API client completes both OAuth flows through the production route
       assert.equal(result.added, true);
       assert.equal(result.claim.code, 'captcha_required');
       assert.deepEqual(callbacks.at(-1), { provider, code, state: flow.flowId });
+      const overview = await api('/overview');
+      assert.ok(overview.accounts.some((a) => a.id === result.label));
+      assert.ok(!JSON.stringify(overview).includes(`profile:${flow.flowId}`));
+      assert.ok(!JSON.stringify(overview).includes(jwt(flow.flowId)));
+      let refreshed;
+      for (let i = 0; i < 100; i++) {
+        refreshed = (await api('/overview')).accounts.find((a) => a.id === result.label);
+        if (!refreshed.eligibilityRefreshing) break;
+        await delay(10);
+      }
+      assert.equal(refreshed.eligibilityRefreshing, false);
+      // Profile enrichment writes the same file in the background; inspect it after completion.
       const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
       const account = saved.find((a) => a.label === result.label);
       assert.equal(account.jwt, jwt(flow.flowId));
       assert.equal(account.activationUserId, `profile:${flow.flowId}`);
-      const overview = await api('/overview');
-      assert.ok(overview.accounts.some((a) => a.id === result.label));
-      assert.ok(!JSON.stringify(overview).includes(`profile:${flow.flowId}`));
-      assert.ok(!JSON.stringify(overview).includes(account.jwt));
+      assert.equal(account.oauthProvider, provider);
+      assert.equal(account.codingPlanProvider, provider);
+      assert.equal(account[provider === 'zai' ? 'zaiAccessToken' : 'bigmodelAccessToken'], `onboard-${provider}-raw`);
+      assert.equal(account[provider === 'zai' ? 'bigmodelAccessToken' : 'zaiAccessToken'], undefined);
+      const coding = refreshed.quotaSources.find((source) => source.id === 'coding');
+      assert.equal(coding.status, 'ready');
+      assert.equal(coding.plans[0].name, 'GLM Coding Plan 优享体验卡');
+      assert.deepEqual(coding.plans[0].items.map((item) => item.remainingPercent), [100, 94, 100]);
+      assert.ok(!JSON.stringify(refreshed).includes(`onboard-${provider}-raw`));
       await assert.rejects(api(pollPath), (error) => error.status === 410 && /flow 不存在/.test(error.message));
     });
   }

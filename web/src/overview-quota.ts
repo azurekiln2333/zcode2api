@@ -48,7 +48,7 @@ export function summarizeOverviewQuota(sources: QuotaSource[]): OverviewQuota {
     const total = amount(item.total)
     const rawRemaining = amount(item.remaining)
     const remaining = rawRemaining !== null && total !== null ? Math.min(rawRemaining, total) : rawRemaining
-    const percent = total !== null && remaining !== null
+    const percent = item.display === 'percent' && amount(item.remainingPercent) !== null ? clamp(item.remainingPercent!) : total !== null && remaining !== null
       ? (total > 0 ? clamp(remaining / total * 100) : 0)
       : (amount(item.remainingPercent) !== null ? clamp(item.remainingPercent!) : null)
     return { total, remaining, percent }

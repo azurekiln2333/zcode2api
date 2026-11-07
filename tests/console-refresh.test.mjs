@@ -97,12 +97,13 @@ test('authenticated console refresh preserves distinct sources and partial failu
       });
     }
     if (url.pathname.endsWith('/quota/limit')) {
-      assert.equal(req.headers.authorization, 'Bearer test-coding-key');
+      if (req.headers.authorization !== 'Bearer test-coding-key') return send(null, 401);
       return send({ level: 'Pro', limits: [
         { type: 'TOKENS_LIMIT', unit: 3, number: 5, usage: 100, currentValue: 20 },
         { type: 'TOKENS_LIMIT', unit: 6, number: 1, usage: 1000, currentValue: 200 },
       ] }, 200);
     }
+    if (url.pathname.endsWith('/subscription/list')) return send([], 200);
     if (url.pathname.endsWith('/billing/preview')) {
       if (req.headers.authorization === `Bearer ${jwt('activation-account')}`) {
         const activated = activationEvents.filter((e) => e.body.user_id === 'authorized-profile').length === 2

@@ -16,7 +16,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { normalizeBilling, normalizeCoding } from './zcgw-quota.mjs';
+import { normalizeBilling } from './zcgw-quota.mjs';
+import { createCodingClient, codingIdentity, codingProviderOf, oauthProviderOf, oauthTokenOf, extractOAuthToken } from './zcgw-coding.mjs';
 import { createVersionManager } from './zcgw-version.mjs';
 import { createClaimAutomation } from './zcgw-auto-claim.mjs';
 import { createCaptchaBrowser } from './zcgw-captcha-browser.mjs';
@@ -136,22 +137,14 @@ const ACC_FILE = path.join(DATA_DIR, 'accounts.json');
 // 关键：这个接口认的是 OAuth access_token，不是 zcodejwttoken。
 // 返回值带 email / phoneNumber(已打码) / countryCode，正好用来判国内 vs 国际。
 const ZAI_ORIGIN = process.env.ZCODE_ZAI_ORIGIN || 'https://api.z.ai';
-const CUSTOMERINFO_URL = `${ZAI_ORIGIN}/api/biz/customer/getCustomerInfo`;
+const codingClient = createCodingClient({ zaiOrigin: ZAI_ORIGIN, zcodeOrigin: UPSTREAM_ORIGIN,
+  bigmodelOrigin: process.env.ZCODE_BIGMODEL_ORIGIN || 'https://open.bigmodel.cn',
+  bigmodelBizOrigin: process.env.ZCODE_BIGMODEL_BIZ_ORIGIN || process.env.ZCODE_BIGMODEL_ORIGIN || 'https://bigmodel.cn' });
 
-async function fetchCustomerInfo(accessToken) {
+async function fetchCustomerInfo(accessToken, provider = 'zai', jwt) {
   if (!accessToken) return null;
-  try {
-    const r = await fetch(CUSTOMERINFO_URL, {
-      headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json' },
-      signal: AbortSignal.timeout(12000),
-    });
-    const j = await safeJson(r);
-    // 这个接口的成功码是 200（不是 0），且外层有 success 字段
-    if (!r.ok || j?.success === false || j?.code !== 200 || !j.data) return null;
-    return j.data;
-  } catch {
-    return null;
-  }
+  const acc = { jwt, [provider === 'bigmodel' ? 'bigmodelAccessToken' : 'zaiAccessToken']: accessToken };
+  return (await codingClient.identity(acc, provider)).profile;
 }
 
 /** 从官方客户档案判断归属：有邮箱=国际，有手机号=国内，countryCode 兜底 */
@@ -243,15 +236,16 @@ async function identifyAll(force = false) {
   }
   let updated = 0;
   for (const rec of arr) {
-    if (!rec.zaiAccessToken) continue;
-    const d = await fetchCustomerInfo(rec.zaiAccessToken);
+    const provider = oauthProviderOf(rec), token = oauthTokenOf(rec, provider);
+    if (!token) continue;
+    const d = await fetchCustomerInfo(token, provider, rec.jwt);
     if (!d) continue;
     // A profile request may finish after reauthorization; never restore its old JWT.
     const latest = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
-    const current = latest.find((a) => a.jwt === rec.jwt && a.zaiAccessToken === rec.zaiAccessToken);
+    const current = latest.find((a) => a.jwt === rec.jwt && oauthTokenOf(a, provider) === token);
     if (current && mergeCustomerInfo(current, d)) {
       fs.writeFileSync(ACC_FILE, JSON.stringify(latest, null, 2));
-      const live = accounts.find((a) => a.jwt === rec.jwt && a.zaiAccessToken === rec.zaiAccessToken);
+      const live = accounts.find((a) => a.jwt === rec.jwt && oauthTokenOf(a, provider) === token);
       if (live) { mergeCustomerInfo(live, d); live.identity = displayIdentity(live); }
       updated += 1;
     }
@@ -259,7 +253,7 @@ async function identifyAll(force = false) {
   if (updated) {
     log(`自动识别账号身份：更新 ${updated} 个`);
   }
-  return { updated, total: arr.length, withToken: arr.filter((a) => a.zaiAccessToken).length };
+  return { updated, total: arr.length, withToken: arr.filter((a) => a.zaiAccessToken || a.bigmodelAccessToken).length };
 }
 
 /** 解本地 ZCode 客户端的加密凭证（单账号回退模式用） */
@@ -372,11 +366,13 @@ function readAccountFile() {
         realm,
         realmZh: REALM_ZH[realm],
         identity: displayIdentity({ email: a.email, phone: a.phone, realm }),
-        hasAccessToken: !!a.zaiAccessToken,
+        hasAccessToken: !!(a.zaiAccessToken || a.bigmodelAccessToken),
         zaiAccessToken: a.zaiAccessToken || null,
+        bigmodelAccessToken: a.bigmodelAccessToken || null,
+        oauthProvider: oauthProviderOf(a),
         activationUserId: typeof a.activationUserId === 'string' ? a.activationUserId.trim() || null : null,
         codingPlanApiKey: a.codingPlanApiKey || null,
-        codingPlanProvider: a.codingPlanProvider || (realm === 'cn' ? 'bigmodel' : 'zai'),
+        codingPlanProvider: codingProviderOf({ ...a, realm }),
         weight: Number(a.weight) || 1,
         disabled: !!a.disabled, // 手动停用：不参与调度（区别于 weight=0 的软暂停）
         // 指纹按账号派生：同号恒定、跨号隔离（见 zcgw-fingerprint.mjs）
@@ -400,6 +396,8 @@ function persistAccount(jwt, label, extra = {}) {
   const email = extra.email || null;
   const realm = extra.realm || detectRealm(jwt, null, email);
   const accessToken = extra.accessToken || null;
+  const oauthProvider = extra.oauthProvider || 'zai';
+  const tokenField = oauthProvider === 'bigmodel' ? 'bigmodelAccessToken' : 'zaiAccessToken';
   const activationUserId = typeof extra.activationUserId === 'string' ? extra.activationUserId.trim() : '';
   const existing = arr.find((a) => userIdFromJwt(a.jwt) === uid);
   if (existing) {
@@ -407,7 +405,12 @@ function persistAccount(jwt, label, extra = {}) {
     if (email) existing.email = email;
     if (extra.name) existing.name = extra.name;
     if (extra.phone) existing.phone = extra.phone;
-    if (accessToken) existing.zaiAccessToken = accessToken;
+    if (accessToken) existing[tokenField] = accessToken;
+    if (extra.oauthProvider) {
+      existing.oauthProvider = oauthProvider;
+      // Automatic discovery follows the login provider; an explicit API key keeps its selected platform.
+      if (!existing.codingPlanApiKey) existing.codingPlanProvider = oauthProvider;
+    }
     if (activationUserId) existing.activationUserId = activationUserId;
     if (realm !== 'unknown') existing.realm = realm;
     fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
@@ -419,7 +422,8 @@ function persistAccount(jwt, label, extra = {}) {
     email,
     name: extra.name || null,
     realm,
-    ...(accessToken ? { zaiAccessToken: accessToken } : {}),
+    ...(accessToken ? { [tokenField]: accessToken } : {}),
+    ...(extra.oauthProvider ? { oauthProvider, codingPlanProvider: oauthProvider } : {}),
     ...(activationUserId ? { activationUserId } : {}),
   });
   fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
@@ -1522,7 +1526,7 @@ function handlePool(req, res) {
   });
 }
 
-/** Read-only quota refresh; disabled accounts keep their own quota visibility. */
+/** Refresh quota; disabled accounts keep their own quota visibility. */
 async function handleQuota(req, res) {
   const out = [];
   for (const acc of accounts) {
@@ -1548,14 +1552,18 @@ async function quotaJson(url, headers, { billing = false } = {}) {
 }
 
 function sourceName(acc, id) {
-  return id === 'billing' ? 'ZCode 套餐' : `${acc.codingPlanProvider === 'bigmodel' ? 'BigModel' : 'Z.ai'} Coding Plan`;
+  return id === 'billing' ? 'ZCode 套餐' : `${codingProviderOf(acc) === 'bigmodel' ? 'BigModel' : 'Z.ai'} Coding Plan`;
 }
 
+const codingSnapshotIdentities = new Map();
 async function refreshQuotaSource(acc, id, version) {
   const key = `${acc.label}:${id}`;
   if (accountRefreshes.has(key)) return accountRefreshes.get(key);
+  acc = { ...acc };
   const run = (async () => {
-    const previous = quotaSources.get(acc.label)?.[id];
+    const identity = id === 'coding' ? codingIdentity(acc) : null;
+    const previous = id !== 'coding' || codingSnapshotIdentities.get(acc.label) === identity
+      ? quotaSources.get(acc.label)?.[id] : null;
     const base = { id, name: sourceName(acc, id), plans: previous?.plans || [], syncedAt: previous?.syncedAt || null };
     let source;
     try {
@@ -1565,21 +1573,20 @@ async function refreshQuotaSource(acc, id, version) {
         plans = q.plans;
         setQuotaCache([{ label: acc.label, ...q }]);
       } else {
-        // The stored OAuth token belongs to Z.ai; never send it to a different provider.
-        const token = acc.codingPlanApiKey || (acc.codingPlanProvider !== 'bigmodel' ? acc.zaiAccessToken : null);
-        if (!token) {
-          source = { ...base, plans: [], syncedAt: null, status: 'unconfigured', error: '未接入查询：请在编辑账号中配置 Coding Plan API Key' };
-        } else {
-          const origin = acc.codingPlanProvider === 'bigmodel'
-            ? (process.env.ZCODE_BIGMODEL_ORIGIN || 'https://open.bigmodel.cn') : ZAI_ORIGIN;
-          const data = await quotaJson(`${origin}/api/monitor/usage/quota/limit`, { authorization: `Bearer ${token}`, accept: 'application/json' });
-          if (!Array.isArray(data.limits)) throw new Error('额度响应缺少 limits');
-          plans = normalizeCoding(data);
-        }
+        const reported = typeof version === 'string' ? version : version?.reported || clientVersion.reported();
+        source = { ...base, ...await codingClient.query(acc, {
+          version: reported, headers: accountBillingHeaders(acc, reported), previous,
+        }) };
       }
       source ||= { ...base, plans, syncedAt: new Date().toISOString(), status: 'ready', error: null };
     } catch (e) {
       source = { ...base, status: 'error', error: `${e.message}${id === 'coding' && !acc.codingPlanApiKey ? '；可在编辑账号中配置对应平台的 Coding Plan API Key' : ''}` };
+    }
+    // An earlier request must never repopulate the cache after a login/provider/key change or deletion.
+    if (id === 'coding') {
+      const current = accounts.find((a) => a.label === acc.label);
+      if (!current || codingIdentity(current) !== identity) return source;
+      codingSnapshotIdentities.set(acc.label, identity);
     }
     quotaSources.set(acc.label, { ...quotaSources.get(acc.label), [id]: source });
     return source;
@@ -1695,6 +1702,9 @@ async function refreshAccountEligibility(acc) {
 /** Reauthorization refreshes with the new credentials after older lookups finish. */
 function refreshAfterAuthorization(acc) {
   const label = acc.label;
+  const sources = quotaSources.get(label);
+  if (sources) delete sources.coding;
+  codingSnapshotIdentities.delete(label);
   const pending = [onboardRefreshes.get(label), ...['billing', 'coding', 'activation', 'eligibility', 'manual-refresh']
     .map((kind) => accountRefreshes.get(`${label}:${kind}`))].filter(Boolean);
   eligibilityCache.delete(label);
@@ -1702,12 +1712,14 @@ function refreshAfterAuthorization(acc) {
     await Promise.allSettled(pending);
     let current = accounts.find((a) => a.label === label);
     if (!current) return;
-    if (current.zaiAccessToken) {
-      const token = current.zaiAccessToken;
-      const profile = await fetchCustomerInfo(token);
+    const provider = oauthProviderOf(current);
+    const token = oauthTokenOf(current, provider);
+    if (token) {
+      const jwt = current.jwt;
+      const profile = await fetchCustomerInfo(token, provider, jwt);
       // Re-read after the network wait so concurrent edits/new authorizations survive.
       const records = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
-      const record = records.find((a) => a.label === label && a.jwt === current.jwt && a.zaiAccessToken === token);
+      const record = records.find((a) => a.label === label && a.jwt === jwt && oauthTokenOf(a, provider) === token);
       if (record && mergeCustomerInfo(record, profile)) {
         fs.writeFileSync(ACC_FILE, JSON.stringify(records, null, 2));
         const live = accounts.find((a) => a.label === label && a.jwt === record.jwt);
@@ -1947,7 +1959,7 @@ async function handleAccountAdd(req, res) {
 
   // 有 access_token 就直接查官方客户档案，完全免手填
   let customer = null;
-  if (accessToken) customer = await fetchCustomerInfo(accessToken);
+  if (accessToken) customer = await fetchCustomerInfo(accessToken, 'zai', jwt);
 
   const email = String(customer?.email || body.email || '').trim() || null;
   const phone = String(customer?.phoneNumber || '').trim() || null;
@@ -1971,9 +1983,9 @@ async function handleAccountAdd(req, res) {
     }
   }
   // 只粘了 zcodejwt 也没关系：用 zaiAccessToken 反查客户档案补全身份（免手填）
-  if (acc && !acc.email && !acc.phone && acc.zaiAccessToken) {
+  if (acc && !acc.email && !acc.phone && oauthTokenOf(acc, oauthProviderOf(acc))) {
     try {
-      const c = await fetchCustomerInfo(acc.zaiAccessToken);
+      const c = await fetchCustomerInfo(oauthTokenOf(acc, oauthProviderOf(acc)), oauthProviderOf(acc), acc.jwt);
       if (c) {
         acc.email = c.email || acc.email;
         acc.phone = c.phoneNumber || acc.phone;
@@ -2089,8 +2101,7 @@ async function pollOnboardFlow(flowId, flow) {
   const uid = userIdFromJwt(jwt);
   if (!uid) return { http: 502, body: { error: '授权服务未返回有效账号凭证，请重新授权', code: 'invalid_credentials' } };
   const user = j.data.user ?? {};
-  // ★ 关键：官方客户端就是从 data.zai.access_token 拿的（zai adapter），以前被我们丢掉了
-  const accessToken = j.data.zai?.access_token || j.data.zai?.accessToken || null;
+  const accessToken = extractOAuthToken(j.data, flow.provider);
 
   // Detailed customer lookup runs in the background so a ready poll stays short.
   const email = String(user.email || '').trim() || null;
@@ -2099,7 +2110,7 @@ async function pollOnboardFlow(flowId, flow) {
   const nick = String(user.name || '').trim() || null;
   const label = nick ? `${nick}-${uid.slice(0, 8)}` : uid.slice(0, 8);
 
-  const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken,
+  const { added } = persistAccount(jwt, label, { email, phone, name: nick, realm, accessToken, oauthProvider: flow.provider,
     activationUserId: profileUserId(user) });
   pendingFlows.delete(flowId);
   writeFlows(pendingFlows);
@@ -2731,7 +2742,7 @@ function buildOverview() {
       eligibility: eligibilityCache.get(a.label) || null,
       eligibilityRefreshing: onboardRefreshes.has(a.label),
       hasCodingPlanKey: !!a.codingPlanApiKey,
-      codingPlanProvider: a.codingPlanProvider || (a.realm === 'cn' ? 'bigmodel' : 'zai'),
+      codingPlanProvider: codingProviderOf(a),
       plans: (quotaCache.get(a.label)?.plans || []).filter((p) => p.status === 'active'),
       requests: u.requests,
       errors: u.errors,

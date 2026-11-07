@@ -52,22 +52,64 @@ export function normalizeBilling(data) {
   return plans;
 }
 
-export function normalizeCoding(data) {
-  const limits = Array.isArray(data.limits) ? data.limits : [];
-  if (!limits.length) return [];
+export function codingSubscription(subscriptions) {
+  const list = (Array.isArray(subscriptions) ? subscriptions : []).filter((s) => s && typeof s === 'object');
+  const coding = (s) => /coding/i.test(`${s.productId || ''} ${s.productName || ''}`);
+  const active = (s) => s.inCurrentPeriod === true && String(s.status).toUpperCase() === 'VALID';
+  const available = (s) => s.inCurrentPeriod !== false && (s.status == null || String(s.status).toUpperCase() === 'VALID');
+  return list.find((s) => coding(s) && active(s)) || list.find(active) || list.find(available) || list[0] || null;
+}
+
+function subscriptionExpiry(subscription) {
+  if (!subscription) return null;
+  for (const key of ['nextRenewTime', 'expireTime', 'expire_time', 'endTime', 'end_time', 'expireAt',
+    'expiredTime', 'validEndTime', 'expires_at', 'expiresAt', 'expired_at', 'period_end']) {
+    if (key === 'nextRenewTime' && subscription.autoRenew === true) continue;
+    const date = quotaDate(subscription[key]);
+    if (date) return date;
+  }
+  const dates = typeof subscription.valid === 'string' ? subscription.valid.match(/\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?/g) : null;
+  return dates?.length ? quotaDate(dates.at(-1)) : null;
+}
+
+export function codingPlanMetadata(data = {}, subscriptions = [], campaign = null) {
+  const subscription = codingSubscription(subscriptions);
+  return {
+    id: 'coding-plan', name: String(subscription?.productName || data?.productName || data?.level || 'Coding Plan'),
+    status: String(subscription?.status || 'active'), endsAt: subscriptionExpiry(subscription),
+    ...(campaign ? { campaign } : {}),
+  };
+}
+
+export function normalizeCoding(data, subscriptions = [], mcp = null, campaign = null) {
+  const limits = (Array.isArray(data?.limits) ? data.limits : []).filter((l) => l && typeof l === 'object');
   const periodUnits = { 3: '小时', 4: '天', 5: '月', 6: '周' };
-  return [{
-    id: 'coding-plan', name: String(data.productName || data.level || 'Coding Plan'), status: 'active', endsAt: null,
-    items: limits.map((l, index) => {
-      const period = periodUnits[l.unit] ? `${l.number ?? 1} ${periodUnits[l.unit]}` : '当前周期';
+  const items = limits.map((l, index) => {
+      const unit = Number(l.unit), count = Number(l.number ?? (unit === 3 ? 5 : 1));
+      const period = periodUnits[unit] ? `${count} ${periodUnits[unit]}` : '当前周期';
       const names = { CREDIT_LIMIT: 'Credits', TOKENS_LIMIT: '用量', TIME_LIMIT: '工具用量' };
+      const amount = amounts(l.usage, l.currentValue, l.remaining, l.percentage);
+      // The monitor's percentage is authoritative, including percentage-only/rolling windows.
+      const percentage = quotaNumber(l.percentage);
+      if (percentage !== null) amount.remainingPercent = Math.max(0, Math.min(100, 100 - percentage));
+      const name = l.type === 'TOKENS_LIMIT'
+        ? unit === 3 ? `${count} 小时剩余` : unit === 6 && count === 1 ? '每周剩余' : `${period}剩余`
+        : l.type === 'TIME_LIMIT' && unit === 5 ? '工具调用' : `${names[l.type] || l.type || '额度'} · ${period}`;
       return {
         id: `${l.type || 'limit'}:${l.unit}:${l.number}:${index}`,
-        name: `${names[l.type] || l.type || '额度'} · ${period}`,
-        unit: l.type === 'CREDIT_LIMIT' ? 'Credits' : '单位',
-        ...amounts(l.usage, l.currentValue, l.remaining, l.percentage),
+        name, unit: l.type === 'CREDIT_LIMIT' ? 'Credits' : '单位', display: 'percent',
+        ...amount, resetTimeFormat: unit === 3 ? 'datetime' : 'date',
         resetAt: quotaDate(l.nextResetTime),
       };
-    }),
-  }];
+    });
+  const total = quotaNumber(mcp?.total_usage?.limit);
+  const rawRemaining = mcp?.total_usage?.remaining;
+  const remaining = Number.isFinite(rawRemaining) ? Math.max(0, rawRemaining) : null;
+  if (total > 0 && remaining !== null) {
+    const available = Math.min(total, remaining);
+    items.push({ id: 'zcode-mcp', name: 'ZCode MCP', unit: '次', display: 'percent',
+      ...amounts(total, total - available, available), resetTimeFormat: 'date', resetAt: quotaDate(mcp.next_refresh_at) });
+  }
+  if (!items.length) return [];
+  return [{ ...codingPlanMetadata(data, subscriptions, campaign), items }];
 }

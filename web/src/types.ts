@@ -35,6 +35,8 @@ export interface QuotaItem {
   remaining: number | null
   remainingPercent: number | null
   resetAt: string | null
+  display?: 'percent'
+  resetTimeFormat?: 'datetime' | 'date'
 }
 
 export interface QuotaPlan {
@@ -43,6 +45,7 @@ export interface QuotaPlan {
   status: string
   endsAt: string | null
   items: QuotaItem[]
+  campaign?: { label: string; description: string }
 }
 
 export interface QuotaSource {

@@ -37,6 +37,15 @@ test('mixed units and overlapping Coding Plan windows yield one normalized perce
   assert.equal(coding.unit, null);
 });
 
+test('overview uses authoritative Coding Plan percentages even when rolling counters differ', () => {
+  const coding = summarizeOverviewQuota([source([
+    item({ unit: '单位', total: 1000, remaining: 1000, remainingPercent: 94, display: 'percent' }),
+    item({ unit: '次', total: 500, remaining: 500, remainingPercent: 100, display: 'percent' }),
+  ], { id: 'coding' })]);
+  assert.equal(coding.mode, 'percent');
+  assert.equal(coding.percent, 97);
+});
+
 test('zero, unknown and partial quotas remain distinct and empty source errors are hidden', () => {
   const exhausted = summarizeOverviewQuota([source([item({ remaining: 0 })])]);
   assert.equal(exhausted.remaining, 0);
