@@ -94,6 +94,7 @@ for (const provider of ['zai', 'bigmodel']) {
       ...(provider === 'zai' ? { zaiAccessToken: 'zai-raw' } : { bigmodelAccessToken: 'bigmodel-oauth' }) };
     const result = await client.query(account, { version: '3.18.0' });
     assert.equal(result.error, null); assert.equal(result.status, 'ready');
+    assert.equal(result.recovery, null);
     assert.equal(result.plans[0].name, 'GLM Coding Plan 优享体验卡');
     assert.deepEqual(result.plans[0].items.map((item) => item.remainingPercent), [100, 94, 100]);
     assert.equal(result.plans[0].campaign.label, '150% 配额');
@@ -217,6 +218,8 @@ test('a discovered key survives a new client and expired OAuth without leaking i
   const after = await second.client.query(restarted);
   assert.deepEqual(after.plans[0].items.map((item) => item.remainingPercent), [100, 94]);
   assert.equal(after.status, 'error', 'MCP still needs valid OAuth, even when monitor works');
+  assert.equal(after.recovery.reason, 'expired_oauth');
+  assert.match(after.recovery.message, /MCP/);
   assert.ok(after.diagnostics.credentials.savedKey);
   assert.ok(!second.requests.some((req) => req.path.includes('/api_keys')));
   for (const secret of [account.jwt, account.bigmodelAccessToken, saved.apiKey, 'persisted-secret']) {
@@ -273,8 +276,60 @@ test('all-auth failure retries first candidate once and diagnostics preserve onl
   { wait: async (ms) => { waits.push(ms); } });
   const result = await client.query({ jwt: 'private-jwt', oauthProvider: 'bigmodel', bigmodelAccessToken: 'private-oauth' });
   assert.equal(result.status, 'error');
+  assert.equal(result.recovery.reason, 'expired_oauth');
   assert.deepEqual(waits, [1500]);
   assert.equal(requests.filter((req) => req.path.endsWith('/quota/limit')).length, 3);
   assert.ok(result.diagnostics.steps.some((step) => step.resource === '客户资料' && step.code === 401));
   for (const secret of ['private-jwt', 'private-oauth', 'sensitive-token-and-customer-info']) assert.ok(!JSON.stringify(result).includes(secret));
+});
+
+for (const provider of ['zai', 'bigmodel']) {
+  test(`${provider}: missing OAuth offers reauthorization even when a saved key returns quota`, async () => {
+    const { client } = harness((req) => {
+      if (req.path.endsWith('/quota/limit')) return req.headers.get('authorization') === 'Bearer saved-key' ? ok(quota) : ok(null, 401);
+      if (req.path.endsWith('/subscription/list')) return ok(subscriptions);
+      return ok({}, 0);
+    });
+    const account = { jwt: 'gateway-jwt', codingPlanProvider: provider };
+    const missing = await client.query(account);
+    assert.equal(missing.recovery.action, 'reauthorize');
+    assert.equal(missing.recovery.provider, provider);
+    assert.equal(missing.recovery.reason, 'missing_oauth');
+    const saved = await client.query({ ...account, codingPlanCredential: {
+      provider, owner: codingCredentialOwner(account), apiKey: 'saved-key',
+    } });
+    assert.equal(saved.status, 'ready');
+    assert.equal(saved.plans[0].items.length, 2);
+    assert.equal(saved.recovery.reason, 'missing_oauth');
+    assert.match(saved.recovery.message, /MCP/);
+  });
+}
+
+test('empty plans and non-auth failures never request reauthorization; renewed OAuth clears the prompt', async () => {
+  let mode = 'empty';
+  const { client } = harness((req) => {
+    if (req.path.endsWith('/client/configs')) return ok({}, 0);
+    if (mode === 'network') throw new Error('connection interrupted');
+    if (mode === 'business') return ok(null, 500);
+    if (mode === 'expired') return ok(null, 401);
+    if (req.path.endsWith('getCustomerInfo')) return ok({});
+    if (req.path.endsWith('/quota/limit')) return ok({ limits: [] });
+    if (req.path.endsWith('/subscription/list')) return ok([]);
+    return ok(null, 0);
+  });
+  const account = { jwt: 'gateway-jwt', oauthProvider: 'bigmodel' };
+  for (mode of ['empty', 'network', 'business']) {
+    const result = await client.query({ ...account, bigmodelAccessToken: `oauth-${mode}` });
+    assert.equal(result.recovery, null, mode);
+  }
+  mode = 'expired';
+  assert.equal((await client.query({ ...account, bigmodelAccessToken: 'old-oauth' })).recovery.reason, 'expired_oauth');
+  mode = 'empty';
+  assert.equal((await client.query({ ...account, bigmodelAccessToken: 'renewed-oauth' })).recovery, null);
+  mode = 'expired';
+  for (const bigmodelAccessToken of [undefined, 'expired-oauth']) {
+    const result = await client.query({ ...account, bigmodelAccessToken, codingPlanApiKey: 'manual-other-owner' });
+    assert.equal(result.status, 'error');
+    assert.equal(result.recovery, null, 'a manual key failure is not proof about the account OAuth');
+  }
 });

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   Check,
   ExternalLink,
@@ -14,9 +14,13 @@ import { api } from '../api'
 import { notify, useConsole } from '../console'
 import ModalShell from './ModalShell.vue'
 
+const props = defineProps<{
+  target?: { id: string; name: string; identity: string | null } | null
+  initialProvider?: 'zai' | 'bigmodel'
+}>()
 const emit = defineEmits<{ close: [] }>()
 const { syncAuthorizedAccount } = useConsole()
-interface OnboardResult { status: string; label?: string }
+interface OnboardResult { status: string; label?: string; hasAccessToken?: boolean }
 
 interface Flow {
   flowId: string
@@ -33,6 +37,7 @@ const stateText = ref('')
 const finished = ref(false)
 const checking = ref(false)
 const pasteUrl = ref('')
+const terminal = ref(false)
 let pollTimer: number | undefined
 
 const providerMeta = {
@@ -48,15 +53,22 @@ function stopPoll() {
 }
 let disposed = false
 onBeforeUnmount(() => { disposed = true; stopPoll() })
+onMounted(() => { if (props.initialProvider) void start(props.initialProvider) })
 
 async function start(p: 'zai' | 'bigmodel') {
+  if (starting.value || checking.value || disposed) return
   stopPoll()
   provider.value = p
   starting.value = true
   flow.value = null
+  finished.value = false
+  terminal.value = false
+  pasteUrl.value = ''
   stateText.value = '正在创建授权链接…'
   try {
-    flow.value = await api<Flow>('/onboard/start', 'POST', { provider: p })
+    flow.value = await api<Flow>('/onboard/start', 'POST', {
+      provider: p, ...(props.target ? { accountId: props.target.id } : {}),
+    })
     if (disposed) return
     stateText.value = '自动等待授权结果…'
     const interval = Math.max(2, flow.value.pollIntervalSec || 2) * 1000
@@ -68,8 +80,18 @@ async function start(p: 'zai' | 'bigmodel') {
   }
 }
 
+function handleFlowError(error: unknown, prefix: string) {
+  const status = (error as { status?: number }).status
+  const message = error instanceof Error ? error.message : '未知错误'
+  if (status === 409 || status === 410 || status === 422) {
+    stopPoll()
+    terminal.value = true
+    stateText.value = message
+  } else stateText.value = `${prefix}：${message}`
+}
+
 async function pollOnce() {
-  if (!flow.value || finished.value || checking.value || disposed) return
+  if (!flow.value || finished.value || checking.value || terminal.value || disposed) return
   checking.value = true
   try {
     const r = await api<OnboardResult>(
@@ -85,18 +107,12 @@ async function pollOnce() {
     }
     finish(r)
   } catch (e) {
-    const status = (e as { status?: number }).status
-    if (status === 410) {
-      stopPoll()
-      stateText.value = '授权流程已过期或已失效，请重新发起登录'
-    } else {
-      stateText.value = `等待重连：${e instanceof Error ? e.message : '未知错误'}`
-    }
+    handleFlowError(e, '等待重连')
   } finally { checking.value = false }
 }
 
 async function submitPaste() {
-  if (!flow.value || finished.value || checking.value || disposed) return
+  if (!flow.value || finished.value || checking.value || terminal.value || disposed) return
   const url = pasteUrl.value.trim()
   if (!url) {
     stateText.value = '请先粘贴授权完成后浏览器地址栏的链接'
@@ -114,17 +130,18 @@ async function submitPaste() {
         '提交了但还没生效：确认浏览器已走到授权最后一步；若 code 已被浏览器消费过，稍等自动轮询即可'
     else stateText.value = `当前状态：${r.status}`
   } catch (e) {
-    const status = (e as { status?: number }).status
-    if (status === 410) {
-      stopPoll()
-      stateText.value = '授权流程不存在或已过期，请重新发起登录'
-    } else stateText.value = `提交失败：${e instanceof Error ? e.message : '未知错误'}`
+    handleFlowError(e, '提交失败')
   } finally { checking.value = false }
 }
 
 function finish(result: OnboardResult) {
   if (finished.value || disposed) return
   stopPoll()
+  if (result.hasAccessToken === false) {
+    terminal.value = true
+    stateText.value = '授权服务未返回完整授权凭证，请重新发起授权'
+    return
+  }
   finished.value = true
   notify('授权成功，正在自动刷新资格与额度…')
   if (result.label) void syncAuthorizedAccount(result.label)
@@ -136,8 +153,8 @@ const expireAt = () =>
 
 <template>
   <ModalShell
-    title="登录新账号"
-    subtitle="国际号走 z.ai 登录页，国内号走 bigmodel 登录页，选错会卡在授权页。"
+    :title="target ? `重新授权 · ${target.name}` : '登录新账号'"
+    :subtitle="target ? `请使用该账号原有的手机号或邮箱登录${target.identity ? `（${target.identity}）` : ''}，完成后自动刷新资格与额度。` : '国际号走 z.ai 登录页，国内号走 bigmodel 登录页，选错会卡在授权页。'"
     wide
     @close="emit('close')"
     ><div class="modal-body onboard-body">
@@ -160,6 +177,14 @@ const expireAt = () =>
         <p v-if="stateText" class="onboard-state" :role="starting ? 'status' : 'alert'">
           <LoaderCircle v-if="starting" :size="14" class="spin" />{{ stateText }}
         </p>
+      </template>
+      <template v-else-if="terminal">
+        <p class="onboard-state" role="alert"><CircleAlert :size="16" />{{ stateText }}</p>
+        <div class="onboard-actions">
+          <button type="button" class="button primary" :disabled="checking || starting" @click="start(provider!)">
+            <RefreshCw :size="15" />重新发起授权
+          </button>
+        </div>
       </template>
       <template v-else>
         <div class="success-callout">

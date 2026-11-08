@@ -2069,9 +2069,13 @@ async function handleOnboardStart(req, res) {
   const raw = await readBody(req).catch(() => null);
   let body = {};
   try { body = raw?.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+  const accountId = typeof body.accountId === 'string' ? body.accountId.trim() : '';
+  const target = accountId ? readAccountFile().find((a) => a.label === accountId) : null;
+  if (accountId && !target) return sendJson(res, 404, { error: '账号已不存在，请刷新账号列表后重试', code: 'account_missing' });
   // 国内号走 bigmodel.cn 登录页，国际号走 chat.z.ai —— provider 选错整条授权链就是死的
   const provider = ONBOARD_PROVIDERS.includes(body.provider) ? body.provider
-    : (ONBOARD_PROVIDERS.includes(process.env.ZCGW_ONBOARD_PROVIDER) ? process.env.ZCGW_ONBOARD_PROVIDER : 'zai');
+    : (target ? oauthProviderOf(target) || codingProviderOf(target)
+      : ONBOARD_PROVIDERS.includes(process.env.ZCGW_ONBOARD_PROVIDER) ? process.env.ZCGW_ONBOARD_PROVIDER : 'zai');
   const pollToken = crypto.randomBytes(32).toString('hex');
   const deviceId = crypto.randomUUID();
   let j;
@@ -2093,7 +2097,8 @@ async function handleOnboardStart(req, res) {
   let state = '';
   try { state = new URL(authorize_url).searchParams.get('state') || ''; } catch {}
   pendingFlows.set(flow_id, { pollToken: typeof j.data.poll_token === 'string' && j.data.poll_token.trim() || pollToken,
-    deviceId, createdAt: Date.now(), provider, state });
+    deviceId, createdAt: Date.now(), provider, state,
+    ...(target ? { targetAccount: { label: target.label, uid: target.uid } } : {}) });
   writeFlows(pendingFlows);
   log(`onboard flow 已创建 ${flow_id} (provider=${provider})`);
   sendJson(res, 200, { flowId: flow_id, authorizeUrl: authorize_url, expiresAt: expires_at, pollIntervalSec: poll_interval_sec, provider });
@@ -2126,9 +2131,21 @@ async function pollOnboardFlow(flowId, flow) {
   // 授权完成：保存 JWT、OAuth access_token 和授权身份，再异步刷新资格与额度。
   const jwt = j.data.token;
   const uid = userIdFromJwt(jwt);
-  if (!uid) return { http: 502, body: { error: '授权服务未返回有效账号凭证，请重新授权', code: 'invalid_credentials' } };
+  if (!uid) return { http: 422, body: { error: '授权服务未返回有效账号凭证，请重新发起授权', code: 'invalid_credentials' } };
   const user = j.data.user ?? {};
   const accessToken = extractOAuthToken(j.data, flow.provider);
+  if (!accessToken) return { http: 422, body: {
+    error: `授权服务未返回${flow.provider === 'bigmodel' ? '国内' : '国际'}平台的完整授权凭证，请重新发起授权；现有账号未修改`,
+    code: 'missing_oauth',
+  } };
+  if (flow.targetAccount) {
+    const target = readAccountFile().find((a) => a.label === flow.targetAccount.label && a.uid === flow.targetAccount.uid);
+    if (!target) return { http: 409, body: { error: '待重新授权的账号已变更或被删除，请刷新账号列表后重试', code: 'account_changed' } };
+    if (uid !== target.uid) return { http: 409, body: {
+      error: '本次登录的账号与待重新授权账号不一致，请使用原账号的手机号或邮箱重新发起授权；现有账号未修改',
+      code: 'account_mismatch',
+    } };
+  }
 
   // Detailed customer lookup runs in the background so a ready poll stays short.
   const email = String(user.email || '').trim() || null;

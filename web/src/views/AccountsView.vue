@@ -59,6 +59,8 @@ const detailsAccountId = ref<string | null>(null)
 const detailsPlanId = ref<string>()
 const detailsAccount = computed(() => accounts.value.find((a) => a.id === detailsAccountId.value) ?? null)
 const showOnboard = ref(false)
+const onboardAccount = ref<Account | null>(null)
+const onboardProvider = ref<'zai' | 'bigmodel'>()
 const page = ref(1)
 const sortBy = ref<'created' | 'name'>('created')
 const groups = computed(() => [...new Set(accounts.value.map((a) => a.group))])
@@ -152,7 +154,9 @@ function edit(account: Account | null = null) {
   showEditor.value = true
   managingId.value = null
 }
-function startOnboard() {
+function startOnboard(account: Account | null = null, provider?: 'zai' | 'bigmodel') {
+  onboardAccount.value = account
+  onboardProvider.value = provider
   showOnboard.value = true
   managingId.value = null
 }
@@ -430,7 +434,8 @@ async function batch(enabled: boolean) {
               </div>
             </td>
             <td class="quota-cell">
-              <QuotaDetails :sources="account.quotaSources || []" />
+              <QuotaDetails :sources="account.quotaSources || []" :refreshing="account.eligibilityRefreshing"
+                @reauthorize="startOnboard(account, $event)" />
               <div class="eligibility-status">
                 <button class="text-link small-link" :disabled="!!refreshProgress"
                   @click="refreshQualifications([account.id])">
@@ -605,6 +610,8 @@ async function batch(enabled: boolean) {
   />
   <OnboardDialog
     v-if="showOnboard"
+    :target="onboardAccount"
+    :initial-provider="onboardProvider"
     @close="showOnboard = false"
   />
   <ModalShell
@@ -637,7 +644,7 @@ async function batch(enabled: boolean) {
       >
         <Activity :size="19" /><strong>连通自检</strong
         ><small>真实调用一次上游推理</small></button
-      ><button @click="startOnboard()">
+      ><button @click="startOnboard(managing)">
         <Cloud :size="19" /><strong>重新登录授权</strong
         ><small>更新授权并自动刷新资格与额度</small></button
       >

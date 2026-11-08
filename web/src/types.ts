@@ -55,6 +55,12 @@ export interface QuotaSource {
   plans: QuotaPlan[]
   syncedAt: string | null
   error: string | null
+  recovery?: {
+    action: 'reauthorize'
+    provider: 'zai' | 'bigmodel'
+    reason: 'missing_oauth' | 'expired_oauth'
+    message: string
+  } | null
   diagnostics?: {
     provider: string
     credentials: { oauth: boolean; savedKey: boolean; manualKey: boolean }

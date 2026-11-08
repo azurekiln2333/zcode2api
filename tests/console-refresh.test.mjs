@@ -62,9 +62,11 @@ test('authenticated console refresh preserves distinct sources and partial failu
       return send({ flow_id: 'test-login', authorize_url: 'https://example.invalid/login?state=test-login', poll_interval_sec: 1 });
     }
     if (url.pathname.endsWith('/oauth/cli/poll/test-login')) {
-      return send({ status: 'ready', token: renewedJwt, user: { id: 'reauthed-profile', user_id: 'different-namespace', name: 'Test user' } });
+      return send({ status: 'ready', token: renewedJwt, bigmodel: { access_token: 'renewed-domestic-token' },
+        user: { id: 'reauthed-profile', user_id: 'different-namespace', name: 'Test user' } });
     }
     if (url.pathname.endsWith('/customer/getCustomerInfo')) {
+      if (req.headers.authorization === 'renewed-domestic-token') return send({}, 200);
       assert.equal(req.headers.authorization, 'Bearer test-profile-token');
       return send({ customerNumber: 'customer-profile-id', phoneNumber: '138****0000', countryCode: '+86' }, 200);
     }
@@ -97,6 +99,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
       });
     }
     if (url.pathname.endsWith('/quota/limit')) {
+      if (req.headers.authorization === 'Bearer renewed-domestic-token') return send({ limits: [] }, 200);
       if (req.headers.authorization !== 'Bearer test-coding-key') return send(null, 401);
       return send({ level: 'Pro', limits: [
         { type: 'TOKENS_LIMIT', unit: 3, number: 5, usage: 100, currentValue: 20 },

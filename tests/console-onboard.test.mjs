@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -54,7 +54,7 @@ test('console API client completes both OAuth flows through the production route
       assert.ok(req.headers['x-zcode-app-version']);
       return send(flow.ready
         ? { status: 'ready', token: flow.token || jwt(id), user: { user_id: `profile:${id}`, name: 'OAuth user' },
-          ...(flow.oauth || (slowProfile ? { zai: { access_token: 'test-slow-profile' } } : {})) }
+          ...(flow.oauth ?? { [flow.provider]: { access_token: `onboard-${flow.provider}-raw` } }) }
         : { status: 'pending' });
     }
     const callback = url.pathname.match(/\/oauth\/cli\/callback\/(zai|bigmodel)$/);
@@ -226,6 +226,91 @@ test('console API client completes both OAuth flows through the production route
     const result = await api(`/onboard/poll/${encodeURIComponent(flow.flowId)}`);
     assert.equal(result.status, 'ready');
     assert.ok((await api('/overview')).accounts.some((a) => a.id === result.label));
+  });
+
+  const waitForRefresh = async (label) => {
+    for (let i = 0; i < 150; i++) {
+      const account = (await api('/overview')).accounts.find((a) => a.id === label);
+      if (!account?.eligibilityRefreshing) return account;
+      await delay(10);
+    }
+    assert.fail('authorization refresh did not complete');
+  };
+
+  await t.test('targeted reauthorization rejects a missing account before contacting OAuth', async () => {
+    const before = oauthCalls;
+    await assert.rejects(api('/onboard/start', 'POST', { provider: 'bigmodel', accountId: 'missing' }),
+      (error) => error.status === 404 && /账号已不存在/.test(error.message));
+    assert.equal(oauthCalls, before);
+  });
+
+  await t.test('incomplete authorization cannot modify an account or trigger its refresh', async () => {
+    for (const account of (await api('/overview')).accounts) await waitForRefresh(account.id);
+    const file = path.join(dataDir, 'accounts.json');
+    const original = await readFile(file, 'utf8');
+    const target = JSON.parse(original).find((a) => a.oauthProvider === 'bigmodel');
+    const before = profileRequests;
+    for (const oauth of [{}, { zai: { access_token: 'wrong-provider-token' } }]) {
+      const flow = await api('/onboard/start', 'POST', { provider: 'bigmodel', accountId: target.label });
+      Object.assign(flows.get(flow.flowId), { ready: true, token: target.jwt + '-renewed', oauth });
+      for (const [route, method, body] of [
+        [`/onboard/poll/${encodeURIComponent(flow.flowId)}`, 'GET'],
+        ['/onboard/redeem', 'POST', { flowId: flow.flowId, code: 'unused', state: flow.flowId }],
+      ]) {
+        const callbackCount = callbacks.length;
+        await assert.rejects(api(route, method, body),
+          (error) => error.status === 422 && /完整授权凭证/.test(error.message));
+        assert.equal(callbacks.length, callbackCount);
+        assert.equal(await readFile(file, 'utf8'), original);
+      }
+    }
+    assert.equal(profileRequests, before);
+    assert.equal((await api('/overview')).accounts.find((a) => a.id === target.label).eligibilityRefreshing, false);
+  });
+
+  await t.test('targeted reauthorization rejects a different identity and preserves settings for the same identity', async () => {
+    const file = path.join(dataDir, 'accounts.json');
+    const target = JSON.parse(await readFile(file)).find((a) => a.oauthProvider === 'bigmodel');
+    await api(`/accounts/${encodeURIComponent(target.label)}`, 'PATCH', { weight: 7, enabled: false, codingPlanApiKey: 'manual-preserved' });
+    const before = await readFile(file, 'utf8');
+    const wrong = await api('/onboard/start', 'POST', { accountId: target.label });
+    assert.equal(wrong.provider, 'bigmodel');
+    flows.get(wrong.flowId).ready = true;
+    await assert.rejects(api(`/onboard/poll/${encodeURIComponent(wrong.flowId)}`),
+      (error) => error.status === 409 && /账号不一致/.test(error.message));
+    assert.equal(await readFile(file, 'utf8'), before);
+    const correct = await api('/onboard/start', 'POST', { provider: 'bigmodel', accountId: target.label });
+    Object.assign(flows.get(correct.flowId), { ready: true, token: target.jwt + '-renewed' });
+    const result = await api(`/onboard/poll/${encodeURIComponent(correct.flowId)}`);
+    assert.equal(result.added, false);
+    assert.equal(result.label, target.label);
+    assert.equal(result.hasAccessToken, true);
+    assert.equal(result.eligibilityRefreshing, true);
+    const refreshed = await waitForRefresh(target.label);
+    assert.equal(refreshed.eligibility.activation.status, 'ready');
+    assert.equal(refreshed.quotaSources.find((s) => s.id === 'coding').recovery, null);
+    const records = JSON.parse(await readFile(file));
+    const saved = records.find((a) => a.label === target.label);
+    assert.equal(records.length, JSON.parse(before).length);
+    assert.equal(saved.weight, 7);
+    assert.equal(saved.disabled, true);
+    assert.equal(saved.codingPlanApiKey, 'manual-preserved');
+    assert.equal(saved.jwt, target.jwt + '-renewed');
+  });
+
+  await t.test('an account removed during authorization cannot be silently recreated', async () => {
+    const file = path.join(dataDir, 'accounts.json');
+    const original = await readFile(file, 'utf8');
+    const target = JSON.parse(original)[0];
+    const flow = await api('/onboard/start', 'POST', { accountId: target.label });
+    Object.assign(flows.get(flow.flowId), { ready: true, token: target.jwt });
+    const without = JSON.stringify(JSON.parse(original).filter((a) => a.label !== target.label));
+    try {
+      await writeFile(file, without);
+      await assert.rejects(api(`/onboard/poll/${encodeURIComponent(flow.flowId)}`),
+        (error) => error.status === 409 && /已变更或被删除/.test(error.message));
+      assert.equal(await readFile(file, 'utf8'), without);
+    } finally { await writeFile(file, original); }
   });
 
   await t.test('a slow customer lookup cannot hold the ready response or consume the flow before the browser gets it', async () => {

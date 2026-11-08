@@ -3,14 +3,22 @@ import { computed } from 'vue'
 import { number, time } from '../console'
 import { visibleQuotaSources } from '../quota'
 import type { QuotaSource } from '../types'
-const props = defineProps<{ sources: QuotaSource[] }>()
+const props = defineProps<{ sources: QuotaSource[]; refreshing?: boolean }>()
+const emit = defineEmits<{ reauthorize: [provider: 'zai' | 'bigmodel'] }>()
 const visibleSources = computed(() => visibleQuotaSources(props.sources))
 const queriedSources = computed(() => props.sources.filter((source) => source.status !== 'pending'))
 const hasFailure = computed(() => queriedSources.value.some((source) => source.status === 'error' || source.status === 'unconfigured'))
+const recoveries = computed(() => props.sources.flatMap((source) => source.recovery ? [source.recovery] : []))
 const shortDate = (value: string) => new Date(value).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })
 </script>
 
 <template>
+  <div v-for="recovery in recoveries" :key="recovery.provider" class="quota-auth-notice" role="status">
+    <span>{{ recovery.message }}</span>
+    <button type="button" class="text-link small-link" :disabled="refreshing" @click="emit('reauthorize', recovery.provider)">
+      {{ refreshing ? '正在刷新额度…' : '重新授权' }}
+    </button>
+  </div>
   <div v-if="visibleSources.length" class="quota-details">
     <section v-for="source in visibleSources" :key="source.id" class="quota-source">
       <strong class="quota-source-name">{{ source.name }}</strong>
@@ -24,7 +32,7 @@ const shortDate = (value: string) => new Date(value).toLocaleDateString('zh-CN',
           <span v-if="plan.campaign" class="quota-campaign" :title="plan.campaign.description">{{ plan.campaign.label }}</span>
           <span v-if="plan.endsAt" class="quota-updated" :title="time(plan.endsAt)">到期 {{ source.id === 'coding' ? shortDate(plan.endsAt) : time(plan.endsAt, true) }}</span>
         </div>
-        <div class="quota-items" :class="{ 'quota-windows': source.id === 'coding' }">
+        <div class="quota-items" :class="{ 'quota-percent-items': plan.items.every(item => item.display === 'percent') }">
           <div v-for="item in plan.items" :key="item.id" class="quota-item">
             <div class="quota-item-header">
               <span class="quota-item-name">{{ item.name }}</span>

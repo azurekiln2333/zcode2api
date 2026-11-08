@@ -299,8 +299,21 @@ export function createCodingClient({ zaiOrigin = 'https://api.z.ai', bigmodelOri
     const errors = results.slice(0, 3).flatMap((result, i) => failed(result)
       ? [`${['周期额度', '套餐订阅', 'ZCode MCP'][i]}：${result.reason.message}`] : []);
     const hasData = plans.some((plan) => plan.items.length);
+    const platformName = provider === 'bigmodel' ? '国内' : '国际';
+    // A manual key may belong to someone else. Its failure is not proof that this account needs login.
+    const missingOAuth = !manualKey && !auth.accessToken;
+    const expiredOAuth = !manualKey && !!auth.accessToken && (
+      (failed(mcp) && mcp.reason.auth) ||
+      (failed(quota) && auth.steps.some((step) => step.resource === '客户资料' &&
+        step.status === 'error' && ([401, 403].includes(step.httpStatus) || [401, 403, 1006].includes(step.code))))
+    );
+    const recovery = missingOAuth || expiredOAuth ? {
+      action: 'reauthorize', provider, reason: missingOAuth ? 'missing_oauth' : 'expired_oauth',
+      message: `${missingOAuth ? `缺少${platformName}授权` : `${platformName}授权已失效`}，请重新授权以查询${hasData && !failed(quota) ? ' MCP ' : ''}额度`,
+    } : null;
     return { plans, status: errors.length ? (!hasData && !manualKey && !savedKey && !auth.accessToken ? 'unconfigured' : 'error') : 'ready',
       error: errors.join('；') || null,
+      recovery,
       diagnostics: { provider, credentials: { oauth: !!auth.accessToken, savedKey: !!savedKey || persisted, manualKey: !!manualKey },
         steps: [...auth.steps, ...(discovered ? auth.keySteps : []), ...steps], checkedAt: new Date(now()).toISOString() },
       syncedAt: errors.length ? (old ? previous.syncedAt : hasData ? new Date(now()).toISOString() : null) : new Date(now()).toISOString() };
