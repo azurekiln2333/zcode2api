@@ -14,7 +14,7 @@ const SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptc
 export const captchaState = ref<'idle' | 'verifying' | 'interactive' | 'ready'>('idle')
 export const captchaMessage = ref('')
 
-interface CaptchaConfig {
+export interface CaptchaConfig {
   enabled: boolean
   region: string
   prefix: string
@@ -126,7 +126,7 @@ function initCaptcha(cfg: CaptchaConfig, current: () => boolean, onFail: (why: u
  * 跑一次人机验证，resolve 出 captchaVerifyParam。
  * 无痕验证失败/超时会转交互模式，由用户点按钮完成。
  */
-export function runCaptcha(options: { interactive?: boolean } = {}): Promise<CaptchaProof> {
+export function runCaptcha(options: { interactive?: boolean; config?: CaptchaConfig } = {}): Promise<CaptchaProof> {
   if (pendingResolve) return Promise.reject(new Error('上一次验证还没完成，请先完成或取消'))
   const id = ++verificationId
   const current = () => id === verificationId && pendingResolve !== null
@@ -145,7 +145,7 @@ export function runCaptcha(options: { interactive?: boolean } = {}): Promise<Cap
       reject(new Error('人机验证准备超时，请检查网络后重试'))
     }, 30000)
     void (async () => {
-      const cfg = await ensureConfig()
+      const cfg = options.config ?? await ensureConfig()
       if (!current()) return
       if (!cfg.enabled || !cfg.sceneId) throw new Error('上游未开启验证码配置，无法领取（可稍后重试）')
       await loadSdk()

@@ -77,6 +77,10 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+      - name: Verify slim published runtime
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ inputs.tag || github.ref_name }}
+        run: bash scripts/ci-image.sh
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,6 +91,7 @@ jobs:
             '' \
             'Deploy: sync docker-compose.yml and run docker compose up -d. Watchtower checks latest every 10 minutes.' \
             'Existing deployments: retain custom ports, environment and data mounts when syncing Compose; pulling the app image alone does not install Watchtower.' \
+            'Slim image: Chromium is no longer bundled. Automatic claims use an open logged-in panel browser; set ZCGW_BROWSER_CDP_URL for an existing external browser if unattended claims are required.' \
             'Source build: docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build.' \
             'data/ 目录保存全部账号与配置，升级镜像不影响数据。')
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

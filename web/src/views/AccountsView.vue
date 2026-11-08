@@ -45,8 +45,8 @@ import QuotaDetails from '../components/QuotaDetails.vue'
 import ClaimDetailsDialog from '../components/ClaimDetailsDialog.vue'
 
 const emit = defineEmits<{ navigate: [page: Page] }>()
-const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts, captchaState, captchaMessage, cancelClaim, claimAll, batchClaim } = useConsole()
-onUnmounted(cancelClaim)
+const { overview, accounts, loading, busy, refresh, action, setEnabled, refreshQualifications, refreshProgress, refreshingAccounts, captchaState, captchaMessage, cancelClaim, cancelManualClaim, claimAll, batchClaim } = useConsole()
+onUnmounted(cancelManualClaim)
 const search = ref('')
 const tab = ref('all')
 const group = ref('all')

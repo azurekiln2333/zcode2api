@@ -63,6 +63,7 @@ const {
   toasts,
   refresh,
   reset,
+  pollAutomaticClaimBrowser,
 } = useConsole()
 const nav = [
   { id: 'overview', label: '运行概览', icon: LayoutDashboard },
@@ -89,6 +90,7 @@ const collapsed = ref(false)
 const contentPane = ref<HTMLElement | null>(null)
 const dark = ref(localStorage.getItem('zcgw-theme') === 'dark')
 let poll: number | undefined
+let browserPoll: number | undefined
 let lastLifecycleRefresh = -Infinity
 
 const loginHint = computed(() => '使用主机上配置的管理密钥登录。')
@@ -169,6 +171,7 @@ async function establishSession() {
   authenticated.value = true
   checkingSession.value = false
   void refresh()
+  void pollAutomaticClaimBrowser()
 }
 async function signIn() {
   signingIn.value = true
@@ -214,6 +217,9 @@ onMounted(async () => {
   window.addEventListener('focus', resumeRefresh)
   window.addEventListener('online', resumeRefresh)
   poll = window.setInterval(refreshPage, 15000)
+  browserPoll = window.setInterval(() => {
+    if (authenticated.value) void pollAutomaticClaimBrowser()
+  }, 3000)
   try {
     await establishSession()
   } catch {
@@ -224,6 +230,8 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   clearInterval(poll)
+  clearInterval(browserPoll)
+  reset()
   window.removeEventListener('hashchange', hashChanged)
   window.removeEventListener('session-expired', expired)
   window.removeEventListener('keydown', shortcuts)

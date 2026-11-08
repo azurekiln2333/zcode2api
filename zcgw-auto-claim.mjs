@@ -55,7 +55,7 @@ function offerKey(account, plan) {
 
 /** Durable daily scheduler. All external effects are injected for deterministic tests. */
 export function createClaimAutomation({ dataDir, getAccounts, reserve, release, refreshAccount, prepare, verify,
-  submit, afterClaim, closeVerifier = async () => {}, now = Date.now, reportError = () => {} }) {
+  submit, afterClaim, closeVerifier = async () => {}, browserStatus = () => null, now = Date.now, reportError = () => {} }) {
   const file = path.join(dataDir, 'auto-claim.json');
   let state = { settings: { ...AUTO_CLAIM_DEFAULTS }, lastScheduledDate: null, run: null, marks: {} };
   let storageError = null;
@@ -88,7 +88,7 @@ export function createClaimAutomation({ dataDir, getAccounts, reserve, release, 
     const key = `${Math.floor(at / 60000)}:${state.lastScheduledDate}:${JSON.stringify(state.settings)}`;
     if (nextCache?.key !== key) nextCache = { key, value: storageError ? null : nextScheduledAt(at, state.settings, state.lastScheduledDate) };
     return structuredClone({ settings: state.settings, nextRunAt: nextCache.value, running: !!active,
-      lastRun: state.run, error: storageError });
+      lastRun: state.run, error: storageError, browser: browserStatus() });
   }
   function configure(input) {
     const settings = validateAutoClaimSettings(input, state.settings);
@@ -103,6 +103,7 @@ export function createClaimAutomation({ dataDir, getAccounts, reserve, release, 
       cancelled = true;
       state.run.status = 'stopping';
       persist();
+      void closeVerifier().catch(reportError);
     }
     return snapshot();
   }
@@ -153,7 +154,7 @@ export function createClaimAutomation({ dataDir, getAccounts, reserve, release, 
             try {
               const prepared = await prepare(acc, plan.planId);
               if (!current()) break;
-              const proof = await verify();
+              const proof = await verify(current);
               if (!current()) break;
               // A crash or timeout after this point must never lead to a replay.
               state.marks[key] = { status: 'pending', at: stamp() };
@@ -174,7 +175,8 @@ export function createClaimAutomation({ dataDir, getAccounts, reserve, release, 
               // A rejected proof or business failure is terminal for this account in this round.
               if (!result.ok && !result.alreadyClaimed) break;
             } catch (error) {
-              record(acc, plan, submitted ? 'unknown' : error.code === 'captcha_interactive' ? 'needs_verification' : 'failed',
+              if (!current() && !submitted) break;
+              record(acc, plan, submitted ? 'unknown' : ['captcha_interactive', 'browser_unavailable'].includes(error.code) ? 'needs_verification' : 'failed',
                 submitted ? '提交结果未知，请刷新套餐并人工确认；不会自动重发' : error.message || '领取准备失败');
               break;
             }

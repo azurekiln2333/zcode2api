@@ -15,6 +15,75 @@ async function loadModule(file, harness) {
 const ref = (value) => ({ value });
 const computed = (get) => ({ get value() { return get(); } });
 
+test('console automatic verification reuses the tab, shares the manual lock and never sends account credentials', async (t) => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout: () => 0 };
+  t.after(() => { globalThis.window = originalWindow; });
+  const calls = [];
+  let finish;
+  const config = { enabled: true, sceneId: 'fresh-scene', region: 'sgp', prefix: 'fixture' };
+  const module = await loadModule('console', {
+    ref, computed, ApiError: class extends Error {}, captchaState: ref('idle'), captchaMessage: ref(''), cancelCaptcha() {},
+    visibleQuotaSources: (v) => v,
+    runCaptcha: (options) => { assert.deepEqual(options, { interactive: false, config }); return new Promise((r) => { finish = r; }); },
+    api: async (path, method, body) => {
+      calls.push({ path, method, body });
+      if (path.endsWith('/browser/poll')) return { task: { id: 'task', expiresAt: Date.now() + 30000, config } };
+      return { accounts: [], settings: {}, stats: {} };
+    },
+  });
+  const state = module.useConsole();
+  const pending = state.pollAutomaticClaimBrowser();
+  while (!finish) await new Promise((r) => setImmediate(r));
+  await state.pollAutomaticClaimBrowser();
+  await state.action('other-account', 'quota');
+  await state.claimAll();
+  assert.equal(calls.length, 1, 'manual and batch operations cannot use the captcha instance simultaneously');
+  state.cancelManualClaim(); // Navigating away from Accounts must not cancel the automatic worker.
+  finish({ param: 'tab-proof', region: 'sgp' });
+  await pending;
+  const result = calls.find((c) => c.path.endsWith('/browser/result'));
+  assert.deepEqual(result.body, { clientId: calls[0].body.clientId, taskId: 'task', param: 'tab-proof' });
+  assert.ok(!calls.some((c) => c.path.includes('/accounts/')));
+
+  finish = null;
+  const cancelled = state.pollAutomaticClaimBrowser();
+  while (!finish) await new Promise((r) => setImmediate(r));
+  state.cancelClaim();
+  finish({ param: 'cancelled-proof' });
+  await cancelled;
+  assert.equal(calls.filter((c) => c.path.endsWith('/browser/result')).at(-1).body.error, 'captcha_cancelled');
+  assert.ok(!JSON.stringify(calls).includes('cancelled-proof'));
+
+  finish = null;
+  const loggedOut = state.pollAutomaticClaimBrowser();
+  while (!finish) await new Promise((r) => setImmediate(r));
+  const beforeLogout = calls.length;
+  state.reset();
+  finish({ param: 'late-after-logout' });
+  await loggedOut;
+  assert.equal(calls.length, beforeLogout);
+});
+
+test('a manual operation started during the browser poll keeps priority over automatic verification', async () => {
+  let deliver;
+  const calls = [];
+  const captchaState = ref('idle');
+  const module = await loadModule('console', {
+    ref, computed, ApiError: class extends Error {}, captchaState, captchaMessage: ref(''), cancelCaptcha() {},
+    visibleQuotaSources: (v) => v, runCaptcha: () => assert.fail('must not overwrite active captcha'),
+    api: async (path, method, body) => {
+      calls.push({ path, body });
+      if (path.endsWith('/browser/poll')) return new Promise((r) => { deliver = r; });
+    },
+  });
+  const pending = module.useConsole().pollAutomaticClaimBrowser();
+  captchaState.value = 'verifying';
+  deliver({ task: { id: 'task', expiresAt: Date.now() + 30000, config: {} } });
+  await pending;
+  assert.equal(calls.at(-1).body.error, 'browser_busy');
+});
+
 test('one-click claim refreshes selected accounts, skips interactive verification, deduplicates and stops on terminal errors', async (t) => {
   const originalWindow = globalThis.window;
   globalThis.window = { setTimeout: () => 0 };

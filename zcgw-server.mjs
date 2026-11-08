@@ -21,6 +21,7 @@ import { createCodingClient, codingIdentity, codingProviderOf, oauthProviderOf, 
 import { createVersionManager } from './zcgw-version.mjs';
 import { createClaimAutomation } from './zcgw-auto-claim.mjs';
 import { createCaptchaBrowser } from './zcgw-captcha-browser.mjs';
+import { createPanelCaptcha } from './zcgw-captcha-panel.mjs';
 import { zcodeRequest, responseJson } from './zcgw-upstream.mjs';
 import { billingHeaders, parseClaimPlan, parseMarketingPlans, mergeClaimPlans, parseCurrentPlans, effectiveAt, claimFailure } from './zcgw-claim.mjs';
 import { metadataUserId, sessionIdFor, requestId, userIdFromJwt, deviceIdFor } from './zcgw-fingerprint.mjs';
@@ -1848,6 +1849,7 @@ async function claimFor(acc, planId, captchaParam, captchaRegion, preparationId,
 }
 
 const automaticCaptcha = createCaptchaBrowser();
+const panelCaptcha = createPanelCaptcha();
 const claimAutomation = createClaimAutomation({
   dataDir: DATA_DIR, getAccounts: () => accounts,
   reserve: (acc) => {
@@ -1859,10 +1861,15 @@ const claimAutomation = createClaimAutomation({
   release: (acc) => { automatedClaimAccounts.delete(acc.label); pendingClaims.delete(acc.label); },
   refreshAccount: refreshAccountEligibility,
   prepare: (acc, planId) => prepareClaim(acc, planId, true),
-  verify: async () => automaticCaptcha.verify(await captchaConfig()),
+  verify: async (current) => {
+    const config = await captchaConfig();
+    if (!current()) throw new Error('自动验证已取消');
+    return automaticCaptcha.mode === 'panel' ? panelCaptcha.verify(config) : automaticCaptcha.verify(config);
+  },
+  browserStatus: () => automaticCaptcha.mode === 'panel' ? panelCaptcha.status() : { mode: automaticCaptcha.mode },
   submit: (acc, prepared, proof) => claimFor(acc, prepared.plan.planId, proof.param, proof.region, prepared.preparationId, true),
   afterClaim: (acc) => Promise.all([refreshQuotaAccount(acc), refreshEligibility(acc)]),
-  closeVerifier: () => automaticCaptcha.close(),
+  closeVerifier: async () => { await panelCaptcha.close(); await automaticCaptcha.close(); },
   reportError: () => log('定时领取任务异常，请检查数据目录权限和浏览器运行环境'),
 });
 
@@ -2870,6 +2877,19 @@ async function handleConsoleApi(req, res, url) {
     catch (error) { return sendJson(res, 409, { error: error.message }); }
   }
   if (p === '/api/claim-automation/cancel' && req.method === 'POST') return sendJson(res, 200, claimAutomation.cancel());
+  if (p === '/api/claim-automation/browser/poll' && req.method === 'POST') {
+    try {
+      const body = JSON.parse((await readBody(req)).toString('utf8'));
+      return sendJson(res, 200, panelCaptcha.poll(body));
+    } catch { return sendJson(res, 400, { error: '浏览器会话参数无效' }); }
+  }
+  if (p === '/api/claim-automation/browser/result' && req.method === 'POST') {
+    try {
+      const body = JSON.parse((await readBody(req)).toString('utf8'));
+      if (!panelCaptcha.complete(body)) return sendJson(res, 409, { error: '该验证已结束或不属于当前浏览器，请重新检测' });
+      return sendJson(res, 200, { ok: true });
+    } catch { return sendJson(res, 400, { error: '验证参数无效' }); }
+  }
   // GET /api/models
   if (req.method === 'GET' && p === '/api/models') {
     const models = [

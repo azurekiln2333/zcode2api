@@ -1,6 +1,6 @@
 import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
-import { runCaptcha, cancelCaptcha, captchaState, captchaMessage } from './captcha'
+import { runCaptcha, cancelCaptcha, captchaState, captchaMessage, type CaptchaConfig } from './captcha'
 import { visibleQuotaSources } from './quota'
 import type { Account, AccountRefresh, ClaimPlan, ClaimResult, ClaimTaskResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings, SelfTestJob } from './types'
 
@@ -29,10 +29,16 @@ let claimGeneration = 0
 let refreshPromise: Promise<void> | null = null
 const logsRequests: Partial<Record<LogChannel, { path: string; promise: Promise<void> }>> = {}
 let sessionGeneration = 0
+let browserClientId: string | null = null
+let browserPolling = false
+let automaticVerification = false
 
 function reset() {
   sessionGeneration++
   cancelClaim()
+  browserClientId = null
+  browserPolling = false
+  automaticVerification = false
   batchClaim.value = null
   activeClaimAccount = null
   overview.value = null
@@ -55,6 +61,49 @@ function cancelClaim() {
   claimGeneration++
   if (batchClaim.value?.running) batchClaim.value.cancelled = true
   cancelCaptcha()
+}
+
+function cancelManualClaim() {
+  if (activeClaimAccount !== null || batchClaim.value?.running) cancelClaim()
+}
+
+/** Reuse this authenticated tab for one automatic proof at a time, including on other panel pages. */
+async function pollAutomaticClaimBrowser() {
+  if (browserPolling) return
+  const session = sessionGeneration
+  const generation = claimGeneration
+  const current = () => session === sessionGeneration
+  const available = () => !automaticVerification && activeClaimAccount === null && !batchClaim.value?.running && captchaState.value === 'idle'
+  browserPolling = true
+  // crypto.randomUUID requires a secure context; support private HTTP deployments too.
+  const clientId = browserClientId ??= Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) => n.toString(16).padStart(2, '0')).join('')
+  try {
+    const { task } = await api<{ task: { id: string; expiresAt: number; config: CaptchaConfig } | null }>(
+      '/claim-automation/browser/poll', 'POST', { clientId, available: available() },
+    )
+    if (!task || !current()) return
+    if (!available() || generation !== claimGeneration || task.expiresAt <= Date.now()) {
+      await api('/claim-automation/browser/result', 'POST', { clientId, taskId: task.id, error: 'browser_busy' })
+      return
+    }
+    automaticVerification = true
+    let result: { param: string } | { error: string }
+    try {
+      const proof = await runCaptcha({ interactive: false, config: task.config })
+      result = { param: proof.param }
+    } catch (error) {
+      result = { error: error && typeof error === 'object' && 'code' in error && error.code === 'captcha_interactive' ? 'captcha_interactive' : 'captcha_failed' }
+    } finally {
+      if (current()) { cancelCaptcha(); automaticVerification = false }
+    }
+    if (!current()) return
+    if (generation !== claimGeneration) result = { error: 'captcha_cancelled' }
+    await api('/claim-automation/browser/result', 'POST', { clientId, taskId: task.id, ...result })
+    if (current()) await refresh()
+  } catch {
+    // Offline tabs/session expiry are surfaced by the scheduler and the normal session handler.
+    // A proof is never replayed after an ambiguous HTTP result.
+  } finally { if (current()) browserPolling = false }
 }
 
 export function notify(text: string, error = false, diagnostics?: ApiDiagnostics) {
@@ -152,7 +201,7 @@ async function refreshLogs(channel: LogChannel = 'requests', query = logQueries[
  */
 async function action(id: string, operation: 'probe' | 'quota', planId?: string) {
   if (busy.value.has(id)) return
-  if (operation === 'quota' && (activeClaimAccount !== null || batchClaim.value?.running)) {
+  if (operation === 'quota' && (activeClaimAccount !== null || batchClaim.value?.running || automaticVerification)) {
     notify('请先完成或取消当前人机验证', true)
     return
   }
@@ -219,7 +268,7 @@ async function action(id: string, operation: 'probe' | 'quota', planId?: string)
 
 /** Refresh each target, then claim each distinct offer once, serially through the official SDK. */
 async function claimAll(ids?: string[]) {
-  if (batchClaim.value?.running || activeClaimAccount !== null || refreshProgress.value) return
+  if (batchClaim.value?.running || activeClaimAccount !== null || refreshProgress.value || automaticVerification) return
   const targets = (overview.value?.accounts ?? []).filter((a) => ids ? ids.includes(a.id) : a.enabled)
   const session = sessionGeneration
   const generation = claimGeneration
@@ -506,9 +555,11 @@ export function useConsole() {
     captchaState,
     captchaMessage,
     cancelClaim,
+    cancelManualClaim,
     refresh,
     refreshLogs,
     reset,
+    pollAutomaticClaimBrowser,
     action,
     setEnabled,
   }

@@ -262,6 +262,7 @@ export interface ClaimTaskResult {
 
 export interface ClaimAutomation {
   settings: { enabled: boolean; time: string; timezone: string }
+  browser?: { mode: 'panel' | 'remote' | 'local'; connectedPanels?: number } | null
   nextRunAt: string | null
   running: boolean
   error: string | null

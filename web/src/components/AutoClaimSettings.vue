@@ -59,7 +59,7 @@ async function operate(operation: 'run' | 'cancel') {
   <section class="section-panel auto-claim-panel">
     <header class="section-heading">
       <Gift :size="20" />
-      <div><h2>每日定时领取</h2><p>每天检测已启用账号的套餐资格，有可领取套餐时自动领取。关闭网页后继续执行。</p></div>
+      <div><h2>每日定时领取</h2><p>每天检测已启用账号的套餐资格，有可领取套餐时自动领取。</p></div>
     </header>
     <form @submit.prevent="save">
       <label class="affinity-toggle">
@@ -72,6 +72,8 @@ async function operate(operation: 'run' | 'cancel') {
         <datalist id="claim-timezones"><option value="Asia/Shanghai" /><option value="UTC" /><option value="Asia/Tokyo" /><option value="America/New_York" /><option value="Europe/London" /></datalist>
       </div>
       <p class="subtle">每个时区日期最多执行一轮；开启或重启时若已过设定时间且当天未执行，将补跑一次。</p>
+      <p class="subtle" v-if="!state?.browser || state.browser.mode === 'panel'">验证使用当前面板浏览器，请保持已登录页面打开、电脑运行。页面关闭或休眠时仍会检测资格，领取需重新检测；如需无人值守，可在部署时连接外部浏览器。</p>
+      <p class="subtle" v-else>验证使用{{ state.browser.mode === 'remote' ? '外部浏览器' : '主机已有浏览器' }}，面板关闭后也可执行；请保持浏览器服务可用。</p>
       <div class="claim-batch-heading">
         <span class="subtle">下次执行：{{ state?.settings.enabled ? date(state.nextRunAt) : '未开启' }} · {{ saved.timezone }}</span>
         <div class="auto-claim-actions">

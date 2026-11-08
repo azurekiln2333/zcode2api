@@ -2,22 +2,49 @@ const SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptc
 const captchaError = (message, code = 'captcha_unavailable') => Object.assign(new Error(message), { code });
 
 /** Use the same official SDK as zcode-switch. Interactive challenges are left for the user. */
-export function createCaptchaBrowser({ executablePath = process.env.ZCGW_CHROMIUM_PATH || '/usr/bin/chromium', launch } = {}) {
+export function createCaptchaBrowser({ executablePath = process.env.ZCGW_CHROMIUM_PATH || '',
+  endpoint = process.env.ZCGW_BROWSER_CDP_URL || '', launch, connect } = {}) {
   let browser;
+  let generation = 0;
+  const contexts = new Set();
+  const mode = endpoint ? 'remote' : executablePath || launch ? 'local' : 'panel';
   async function perform(config) {
     if (!config.enabled || !config.sceneId) throw captchaError('上游验证码配置不可用，请稍后重试');
+    const epoch = generation;
     let context;
     try {
-      if (!browser) {
-        let start = launch;
-        if (!start) {
-          try { const { chromium } = await import('playwright-core'); start = (options) => chromium.launch(options); }
-          catch { throw captchaError('缺少浏览器依赖，请运行 npm ci 或更新到包含定时领取的 Docker 镜像'); }
+      if (!browser || browser.isConnected?.() === false) {
+        if (mode === 'panel') throw captchaError('请保持面板浏览器在线，或配置 ZCGW_BROWSER_CDP_URL', 'browser_unavailable');
+        if (mode === 'remote') {
+          try {
+            const url = new URL(endpoint);
+            if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol) || !url.hostname || endpoint.length > 8192) throw new Error();
+          } catch { throw captchaError('外部浏览器地址无效，请检查 ZCGW_BROWSER_CDP_URL（支持 HTTP/HTTPS/WS/WSS）'); }
         }
-        try { browser = await start({ executablePath, headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'], timeout: 15000 }); }
-        catch { throw captchaError('自动验证浏览器启动失败，请检查 Chromium 安装或 ZCGW_CHROMIUM_PATH'); }
+        let start = mode === 'remote' ? connect : launch;
+        if (!start) {
+          try {
+            const { chromium } = await import('playwright-core');
+            start = mode === 'remote' ? (url, options) => chromium.connectOverCDP(url, options) : (options) => chromium.launch(options);
+          } catch { throw captchaError('缺少浏览器连接组件，请运行 npm ci 或更新镜像'); }
+        }
+        let connection;
+        try {
+          connection = mode === 'remote' ? await start(endpoint, { timeout: 15000 })
+            : await start({ executablePath, headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'], timeout: 15000 });
+        } catch { throw captchaError(mode === 'remote'
+          ? '无法连接外部浏览器，请检查 ZCGW_BROWSER_CDP_URL 和浏览器服务状态'
+          : '已有浏览器启动失败，请检查 ZCGW_CHROMIUM_PATH 指向的可执行文件'); }
+        // Cancellation can arrive while a connection is being established.
+        if (epoch !== generation) {
+          await connection.close().catch(() => {});
+          throw captchaError('自动验证已取消', 'captcha_cancelled');
+        }
+        browser = connection;
       }
       context = await browser.newContext();
+      if (epoch !== generation) throw captchaError('自动验证已取消', 'captcha_cancelled');
+      contexts.add(context);
       const page = await context.newPage();
       page.setDefaultTimeout(20000);
       // A local page carries only captcha configuration. Account credentials never enter the browser.
@@ -63,12 +90,13 @@ export function createCaptchaBrowser({ executablePath = process.env.ZCGW_CHROMIU
           });
         } catch { finish({ interactive: true }); }
       }), config);
+      if (epoch !== generation) throw captchaError('自动验证已取消', 'captcha_cancelled');
       if (!result.param) throw captchaError('需要人工验证，请到账号管理中点击领取完成验证', 'captcha_interactive');
       return { param: result.param, region: config.region };
     } catch (error) {
-      if (error.code) throw error;
+      if (['captcha_unavailable', 'captcha_interactive', 'captcha_cancelled', 'browser_unavailable'].includes(error.code)) throw error;
       throw captchaError('自动验证未完成，请检查验证码网络或到账号管理中手动领取');
-    } finally { await context?.close().catch(() => {}); }
+    } finally { contexts.delete(context); await context?.close().catch(() => {}); }
   }
   async function verify(config) {
     let timer;
@@ -81,6 +109,15 @@ export function createCaptchaBrowser({ executablePath = process.env.ZCGW_CHROMIU
       })]);
     } finally { clearTimeout(timer); }
   }
-  async function close() { const current = browser; browser = null; await current?.close(); }
-  return { verify, close };
+  async function close() {
+    generation++;
+    const current = browser;
+    browser = null;
+    const owned = [...contexts];
+    contexts.clear();
+    await Promise.allSettled(owned.map((context) => context.close()));
+    // For connectOverCDP, close disconnects this client; the external browser stays running.
+    await current?.close();
+  }
+  return { verify, close, mode };
 }

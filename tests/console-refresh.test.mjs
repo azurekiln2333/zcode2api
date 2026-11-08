@@ -563,6 +563,14 @@ test('authenticated console refresh preserves distinct sources and partial failu
   await t.test('daily claim settings API is authenticated, validated and durable, and empty jobs finish asynchronously', async () => {
     const unauthorized = await fetch(`${base}/api/claim-automation`);
     assert.equal(unauthorized.status, 401);
+    for (const operation of ['poll', 'result']) {
+      assert.equal((await fetch(`${base}/api/claim-automation/browser/${operation}`, { method: 'POST' })).status, 401);
+    }
+    assert.equal((await api('/api/claim-automation/browser/poll', 'POST', { clientId: 'invalid', available: true })).status, 400);
+    const clientId = 'test-api-browser-0001';
+    assert.equal((await api('/api/claim-automation/browser/poll', 'POST', { clientId, available: true })).body.task, null);
+    assert.equal((await api('/api/claim-automation')).body.browser.mode, 'panel');
+    assert.equal((await api('/api/claim-automation/browser/result', 'POST', { clientId, taskId: 'stale', param: 'proof' })).status, 409);
     const invalid = await api('/api/claim-automation', 'PATCH', { enabled: 'true', time: '25:00' });
     assert.equal(invalid.status, 400);
     const saved = await api('/api/claim-automation', 'PATCH', { enabled: false, time: '07:45', timezone: 'UTC' });
@@ -570,6 +578,33 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.deepEqual(saved.body.settings, { enabled: false, time: '07:45', timezone: 'UTC' });
     assert.equal((await api('/api/overview')).body.claimAutomation.settings.time, '07:45');
     assert.equal(JSON.parse(await readFile(path.join(dataDir, 'auto-claim.json'))).settings.timezone, 'UTC');
+    for (const acc of (await api('/api/overview')).body.accounts) await api(`/api/accounts/${acc.id}`, 'PATCH', { enabled: acc.id === 'unconfigured' });
+    previewReply = undefined; marketingReply = undefined; failPreview = false; failMarketing = false; emptyMarketing = true;
+    claimCode = 0; claimReply = undefined;
+    const beforeAutomaticClaim = claims;
+    const automaticRun = await api('/api/claim-automation/run', 'POST', {});
+    assert.equal(automaticRun.status, 202);
+    let verification;
+    for (let i = 0; i < 100; i++) {
+      verification = (await api('/api/claim-automation/browser/poll', 'POST', { clientId, available: true })).body.task;
+      if (verification) break;
+      await delay(10);
+    }
+    assert.ok(verification, JSON.stringify((await api('/api/claim-automation')).body));
+    assert.deepEqual(verification.config, { enabled: true, region: 'sgp', prefix: 'test-prefix', sceneId: 'test-scene' });
+    const otherClient = 'second-api-browser-01';
+    assert.equal((await api('/api/claim-automation/browser/poll', 'POST', { clientId: otherClient, available: true })).body.task, null);
+    assert.equal((await api('/api/claim-automation/browser/result', 'POST', { clientId: otherClient, taskId: verification.id, param: 'foreign' })).status, 409);
+    const proofBody = { clientId, taskId: verification.id, param: 'test-captcha' };
+    assert.equal((await api('/api/claim-automation/browser/result', 'POST', proofBody)).status, 200);
+    assert.equal((await api('/api/claim-automation/browser/result', 'POST', proofBody)).status, 409);
+    for (let i = 0; i < 100 && (await api('/api/claim-automation')).body.running; i++) await delay(10);
+    const automaticResult = (await api('/api/claim-automation')).body;
+    assert.equal(automaticResult.running, false);
+    assert.equal(automaticResult.lastRun.results.filter((r) => r.status === 'claimed').length, 1);
+    assert.equal(claims, beforeAutomaticClaim + 1);
+    assert.ok(!JSON.stringify(automaticResult).includes('test-captcha'));
+    assert.ok(!(await readFile(path.join(dataDir, 'auto-claim.json'), 'utf8')).includes('test-captcha'));
     for (const acc of (await api('/api/overview')).body.accounts) await api(`/api/accounts/${acc.id}`, 'PATCH', { enabled: false });
     const before = claims;
     const run = await api('/api/claim-automation/run', 'POST', {});

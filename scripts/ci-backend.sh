@@ -16,6 +16,7 @@ node --check zcgw-upstream.mjs
 node --check zcgw-version.mjs
 node --check zcgw-auto-claim.mjs
 node --check zcgw-captcha-browser.mjs
+node --check zcgw-captcha-panel.mjs
 node scripts/check-version.mjs
 node --test tests/*.test.mjs
 

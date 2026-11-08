@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createClaimAutomation, validateAutoClaimSettings, scheduleDue, nextScheduledAt } from '../zcgw-auto-claim.mjs';
 import { createCaptchaBrowser } from '../zcgw-captcha-browser.mjs';
+import { createPanelCaptcha } from '../zcgw-captcha-panel.mjs';
 
 const account = (label) => ({ label, name: label, jwt: 'fixture-credential', deviceId: 'fixture-device' });
 const offer = (id = 'arbitrary-plan') => ({ planId: id, name: '名称随时改变', campaign: null });
@@ -37,6 +38,27 @@ test('daily schedule validates settings, handles timezones/DST and never repeats
   for (const input of [{ time: '24:00' }, { time: '9:00' }, { enabled: 'true' }, { timezone: 'Mars/Olympus' }, []]) {
     assert.throws(() => validateAutoClaimSettings(input));
   }
+});
+
+test('scheduler without an online browser records a visible pending action; cancellation cannot submit a panel proof', async (t) => {
+  const broker = createPanelCaptcha();
+  const clientId = 'test-panel-00000001';
+  const config = { enabled: true, sceneId: 'fixture', region: 'cn', prefix: 'fixture' };
+  const h = await harness(t, { verify: () => broker.verify(config), closeVerifier: () => broker.close(), browserStatus: broker.status });
+  h.service.start();
+  await h.service.settled();
+  assert.equal(h.service.snapshot().lastRun.results[0].status, 'needs_verification');
+  assert.ok(!h.calls.some((c) => c.startsWith('submit:')));
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.args.dataDir, 'auto-claim.json'))).marks, {});
+  broker.poll({ clientId, available: true });
+  h.service.start();
+  let task;
+  while (!task) { await new Promise((r) => setImmediate(r)); task = broker.poll({ clientId, available: true }).task; }
+  h.service.cancel();
+  await h.service.settled();
+  assert.equal(broker.complete({ clientId, taskId: task.id, param: 'late-proof' }), false);
+  assert.equal(h.service.snapshot().lastRun.status, 'cancelled');
+  assert.ok(!h.calls.some((c) => c.startsWith('submit:')));
 });
 
 test('scheduled claims are persisted before execution, serial, exclude disabled accounts and survive restart', async (t) => {
