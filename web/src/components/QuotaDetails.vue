@@ -5,6 +5,8 @@ import { visibleQuotaSources } from '../quota'
 import type { QuotaSource } from '../types'
 const props = defineProps<{ sources: QuotaSource[] }>()
 const visibleSources = computed(() => visibleQuotaSources(props.sources))
+const queriedSources = computed(() => props.sources.filter((source) => source.status !== 'pending'))
+const hasFailure = computed(() => queriedSources.value.some((source) => source.status === 'error' || source.status === 'unconfigured'))
 const shortDate = (value: string) => new Date(value).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })
 </script>
 
@@ -44,4 +46,25 @@ const shortDate = (value: string) => new Date(value).toLocaleDateString('zh-CN',
       <span v-if="source.syncedAt" class="quota-updated">更新于 {{ time(source.syncedAt, true) }}</span>
     </section>
   </div>
+  <details v-if="queriedSources.length" class="quota-query-details quota-updated">
+    <summary>额度查询详情<span v-if="hasFailure"> · 有项目未查到</span></summary>
+    <section v-for="source in queriedSources" :key="source.id">
+      <strong>{{ source.name }}</strong>
+      <div v-if="source.error">{{ source.error }}</div>
+      <div v-else-if="!source.plans.some(plan => plan.items.length)">本次查询未返回额度项</div>
+      <div v-else>已读取 {{ source.plans.reduce((count, plan) => count + plan.items.length, 0) }} 项额度</div>
+      <template v-if="source.diagnostics">
+        <div>OAuth {{ source.diagnostics.credentials.oauth ? '已保存' : '缺失' }} · 自动 Key {{ source.diagnostics.credentials.savedKey ? '已保存' : '无历史记录' }} · 手填 Key {{ source.diagnostics.credentials.manualKey ? '已配置' : '未配置' }}</div>
+        <div v-for="(step, index) in source.diagnostics.steps" :key="index">
+          {{ step.resource }}<span v-if="step.credential">（{{ step.credential }}）</span>：
+          {{ step.status === 'ready' ? '成功' : step.status === 'skipped' ? '未执行' : '失败' }}
+          <span v-if="step.httpStatus != null"> · HTTP {{ step.httpStatus }}</span>
+          <span v-if="step.code != null"> · 业务码 {{ step.code }}</span>
+          <span v-if="step.count != null"> · {{ step.count }} 项</span>
+          <span v-if="step.error"> · {{ step.error }}</span>
+        </div>
+        <div>额度查询于 {{ time(source.diagnostics.checkedAt, true) }}</div>
+      </template>
+    </section>
+  </details>
 </template>

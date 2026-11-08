@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { normalizeBilling } from './zcgw-quota.mjs';
 import { createCodingClient, codingIdentity, codingProviderOf, oauthProviderOf, oauthTokenOf, extractOAuthToken } from './zcgw-coding.mjs';
-import { createVersionManager } from './zcgw-version.mjs';
+import { createVersionManager, CLIENT_APP_VERSION } from './zcgw-version.mjs';
 import { createClaimAutomation } from './zcgw-auto-claim.mjs';
 import { createCaptchaBrowser } from './zcgw-captcha-browser.mjs';
 import { createPanelCaptcha } from './zcgw-captcha-panel.mjs';
@@ -140,7 +140,22 @@ const ACC_FILE = path.join(DATA_DIR, 'accounts.json');
 const ZAI_ORIGIN = process.env.ZCODE_ZAI_ORIGIN || 'https://api.z.ai';
 const codingClient = createCodingClient({ zaiOrigin: ZAI_ORIGIN, zcodeOrigin: UPSTREAM_ORIGIN,
   bigmodelOrigin: process.env.ZCODE_BIGMODEL_ORIGIN || 'https://open.bigmodel.cn',
-  bigmodelBizOrigin: process.env.ZCODE_BIGMODEL_BIZ_ORIGIN || process.env.ZCODE_BIGMODEL_ORIGIN || 'https://bigmodel.cn' });
+  bigmodelBizOrigin: process.env.ZCODE_BIGMODEL_BIZ_ORIGIN || process.env.ZCODE_BIGMODEL_ORIGIN || 'https://bigmodel.cn',
+  persistCredential: persistCodingCredential });
+
+function persistCodingCredential(snapshot, credential) {
+  const records = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+  const record = records.find((a) => a.jwt === snapshot.jwt && userIdFromJwt(a.jwt) === userIdFromJwt(snapshot.jwt));
+  const current = accounts.find((a) => a.label === snapshot.label);
+  // Discovery awaited upstream I/O. Never overwrite a newer authorization, manual key or provider edit.
+  if (!record || !current || record.codingPlanApiKey ||
+      codingIdentity({ ...record, realm: detectRealm(record.jwt, record.realm, record.email) }) !== codingIdentity(snapshot) ||
+      codingIdentity(current) !== codingIdentity(snapshot)) return false;
+  record.codingPlanCredential = { ...credential };
+  fs.writeFileSync(ACC_FILE, JSON.stringify(records, null, 2));
+  current.codingPlanCredential = { ...credential };
+  return true;
+}
 
 async function fetchCustomerInfo(accessToken, provider = 'zai', jwt) {
   if (!accessToken) return null;
@@ -373,6 +388,7 @@ function readAccountFile() {
         oauthProvider: oauthProviderOf(a),
         activationUserId: typeof a.activationUserId === 'string' ? a.activationUserId.trim() || null : null,
         codingPlanApiKey: a.codingPlanApiKey || null,
+        codingPlanCredential: a.codingPlanCredential || null,
         codingPlanProvider: codingProviderOf({ ...a, realm }),
         weight: Number(a.weight) || 1,
         disabled: !!a.disabled, // 手动停用：不参与调度（区别于 weight=0 的软暂停）
@@ -2057,11 +2073,13 @@ async function handleOnboardStart(req, res) {
   const provider = ONBOARD_PROVIDERS.includes(body.provider) ? body.provider
     : (ONBOARD_PROVIDERS.includes(process.env.ZCGW_ONBOARD_PROVIDER) ? process.env.ZCGW_ONBOARD_PROVIDER : 'zai');
   const pollToken = crypto.randomBytes(32).toString('hex');
+  const deviceId = crypto.randomUUID();
   let j;
   try {
     const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/oauth/cli/init`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${pollToken}`, 'content-type': 'application/json' },
+      headers: { ...billingHeaders({ token: pollToken, deviceId, version: CLIENT_APP_VERSION, origin: UPSTREAM_ORIGIN }),
+        'content-type': 'application/json' },
       body: JSON.stringify({ provider }),
       signal: AbortSignal.timeout(10_000),
     });
@@ -2074,7 +2092,8 @@ async function handleOnboardStart(req, res) {
   // state 是授权链接的全局唯一标识：手动粘贴回调链接时靠它反查是哪个流程
   let state = '';
   try { state = new URL(authorize_url).searchParams.get('state') || ''; } catch {}
-  pendingFlows.set(flow_id, { pollToken, createdAt: Date.now(), provider, state });
+  pendingFlows.set(flow_id, { pollToken: typeof j.data.poll_token === 'string' && j.data.poll_token.trim() || pollToken,
+    deviceId, createdAt: Date.now(), provider, state });
   writeFlows(pendingFlows);
   log(`onboard flow 已创建 ${flow_id} (provider=${provider})`);
   sendJson(res, 200, { flowId: flow_id, authorizeUrl: authorize_url, expiresAt: expires_at, pollIntervalSec: poll_interval_sec, provider });
@@ -2087,7 +2106,8 @@ async function pollOnboardFlow(flowId, flow) {
   let j;
   try {
     const r = await fetch(`${UPSTREAM_ORIGIN}/api/v1/oauth/cli/poll/${encodeURIComponent(flowId)}`, {
-      headers: { authorization: `Bearer ${flow.pollToken}` },
+      headers: billingHeaders({ token: flow.pollToken, deviceId: flow.deviceId,
+        version: CLIENT_APP_VERSION, origin: UPSTREAM_ORIGIN }),
       signal: AbortSignal.timeout(8000),
     });
     j = await safeJson(r);

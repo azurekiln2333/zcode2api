@@ -1,7 +1,6 @@
 import { computed, ref, type Ref } from 'vue'
 import { api, ApiError, type ApiDiagnostics } from './api'
 import { runCaptcha, cancelCaptcha, captchaState, captchaMessage, type CaptchaConfig } from './captcha'
-import { visibleQuotaSources } from './quota'
 import type { Account, AccountRefresh, ClaimPlan, ClaimResult, ClaimTaskResult, LogChannel, LogEntry, LogPage, LogQuery, Overview, Settings, SelfTestJob } from './types'
 
 const overview = ref<Overview | null>(null)
@@ -360,7 +359,7 @@ async function syncAuthorizedAccount(id: string) {
     if (!refreshError.value && account && !account.eligibilityRefreshing) {
       const state = account.eligibility
       const failed = !state || state.status !== 'ready' || !!state.activation?.error || !!state.currentError
-        || visibleQuotaSources(account.quotaSources).some((s) => s.status === 'error')
+        || account.quotaSources.some((s) => s.status === 'error' || s.status === 'unconfigured')
       notify(failed ? '授权已更新，资格或额度查询有异常，请查看账号提示' : '授权已更新，资格与额度已自动刷新', failed)
       return
     }
@@ -391,7 +390,7 @@ async function refreshQualifications(ids?: string[]) {
       refreshingAccounts.value.add(id)
       try {
         const result = await refreshAccount(id)
-        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.eligibility.currentError || visibleQuotaSources(result.quotaSources).some((s) => s.status === 'error')) failures++
+        if (result.eligibility.status !== 'ready' || result.eligibility.activation?.error || result.eligibility.currentError || result.quotaSources.some((s) => s.status === 'error' || s.status === 'unconfigured')) failures++
       } catch (error) {
         failures++
         if (generation === sessionGeneration) notify(`${id}：${error instanceof Error ? error.message : '刷新失败'}`, true)

@@ -308,3 +308,24 @@ test('authorization synchronization updates account state and stops on session r
   assert.equal(state.toasts.value.length, notifications);
   assert.ok(calls.every((call) => call.path === '/overview' && call.method === undefined));
 });
+
+test('hidden empty quota failures cannot be reported as a successful refresh or authorization sync', async (t) => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { setTimeout: () => 0 };
+  t.after(() => { globalThis.window = originalWindow; });
+  for (const status of ['error', 'unconfigured']) {
+    const account = { id: 'empty-quota', eligibilityRefreshing: false,
+      quotaSources: [{ id: 'coding', status, error: '周期额度查询失败', plans: [] }],
+      eligibility: { status: 'ready', plans: [], activation: { status: 'ready' } } };
+    const module = await loadModule('console', {
+      ref, computed, ApiError: class extends Error {}, captchaState: ref('idle'), captchaMessage: ref(''), cancelCaptcha() {},
+      api: async (path) => path.endsWith('/refresh') ? account : { accounts: [account], stats: {}, settings: {} },
+    });
+    const state = module.useConsole();
+    await state.syncAuthorizedAccount(account.id);
+    assert.equal(state.toasts.value.at(-1).error, true);
+    await state.refreshQualifications([account.id]);
+    assert.equal(state.toasts.value.at(-1).error, true);
+    assert.match(state.toasts.value.at(-1).text, /需要查看资格或额度提示/);
+  }
+});

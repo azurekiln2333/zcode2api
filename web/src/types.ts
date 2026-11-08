@@ -55,6 +55,12 @@ export interface QuotaSource {
   plans: QuotaPlan[]
   syncedAt: string | null
   error: string | null
+  diagnostics?: {
+    provider: string
+    credentials: { oauth: boolean; savedKey: boolean; manualKey: boolean }
+    checkedAt: string
+    steps: Array<{ resource: string; credential?: string; status: 'ready' | 'error' | 'skipped'; httpStatus?: number; code?: number; count?: number; error?: string }>
+  }
 }
 
 export interface ClaimPlan {

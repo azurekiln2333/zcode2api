@@ -37,9 +37,12 @@ test('console API client completes both OAuth flows through the production route
       for await (const chunk of req) chunks.push(chunk);
       const { provider } = JSON.parse(Buffer.concat(chunks));
       const id = `${provider}:${flows.size + 1}`;
-      flows.set(id, { provider, pollToken: req.headers.authorization, ready: false });
+      assert.match(req.headers['user-agent'], /^ZCode\//);
+      assert.ok(req.headers['x-zcode-app-version']);
+      assert.ok(req.headers['x-device-mid']);
+      flows.set(id, { provider, pollToken: `Bearer returned-poll-${id}`, deviceId: req.headers['x-device-mid'], ready: false });
       return send({ flow_id: id, authorize_url: `https://example.invalid/authorize?state=${encodeURIComponent(id)}`,
-        expires_at: Math.floor(Date.now() / 1000) + 1200, poll_interval_sec: 2 });
+        poll_token: `returned-poll-${id}`, expires_at: Math.floor(Date.now() / 1000) + 1200, poll_interval_sec: 2 });
     }
     const poll = url.pathname.match(/\/oauth\/cli\/poll\/(.+)$/);
     if (poll) {
@@ -47,6 +50,8 @@ test('console API client completes both OAuth flows through the production route
       const id = decodeURIComponent(poll[1]);
       const flow = flows.get(id);
       if (!flow || req.headers.authorization !== flow.pollToken) return send(null, 3004, 410);
+      assert.equal(req.headers['x-device-mid'], flow.deviceId);
+      assert.ok(req.headers['x-zcode-app-version']);
       return send(flow.ready
         ? { status: 'ready', token: flow.token || jwt(id), user: { user_id: `profile:${id}`, name: 'OAuth user' },
           ...(flow.oauth || (slowProfile ? { zai: { access_token: 'test-slow-profile' } } : {})) }
@@ -73,12 +78,24 @@ test('console API client completes both OAuth flows through the production route
       profileRequests++;
       if (profileGate) await profileGate;
       await slowProfile;
-      return send({ email: 'oauth@example.invalid', id: 'customer-profile' }, 200);
+      return send({ email: 'oauth@example.invalid', id: 'customer-profile', organizations: [
+        { organizationId: 'org', projects: [{ projectId: 'project', projectType: 0 }] },
+      ] }, 200);
     }
-    if (url.pathname.endsWith('/quota/limit')) return send({ limits: [
+    if (url.pathname.includes('/api_keys')) {
+      assert.equal(req.headers['content-type'], 'application/json');
+      const provider = req.headers.authorization === 'onboard-bigmodel-raw' ? 'bigmodel' : 'zai';
+      return url.pathname.includes('/copy/') ? send({ secretKey: `discovered-${provider}-secret` }, 200)
+        : send([{ name: 'zcode-api-key', apiKey: `discovered-${provider}-key` }], 200);
+    }
+    if (url.pathname.endsWith('/quota/limit')) {
+      if ([jwt('zai:1'), jwt('bigmodel:2'), 'onboard-zai-business', 'onboard-bigmodel-raw']
+        .some((token) => req.headers.authorization === `Bearer ${token}`)) return send(null, 401);
+      return send({ limits: [
       { type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 0 },
       { type: 'TOKENS_LIMIT', unit: 6, number: 1, percentage: 6 },
     ] }, 200);
+    }
     if (url.pathname.endsWith('/subscription/list')) return send([{
       productId: 'trial-coding', productName: 'GLM Coding Plan 优享体验卡', status: 'VALID', inCurrentPeriod: true,
       expireTime: '2026-11-11T15:59:59Z',
@@ -191,11 +208,14 @@ test('console API client completes both OAuth flows through the production route
       assert.equal(account.codingPlanProvider, provider);
       assert.equal(account[provider === 'zai' ? 'zaiAccessToken' : 'bigmodelAccessToken'], `onboard-${provider}-raw`);
       assert.equal(account[provider === 'zai' ? 'bigmodelAccessToken' : 'zaiAccessToken'], undefined);
+      assert.deepEqual(account.codingPlanCredential, { provider, owner: flow.flowId,
+        apiKey: `discovered-${provider}-key.discovered-${provider}-secret` });
       const coding = refreshed.quotaSources.find((source) => source.id === 'coding');
       assert.equal(coding.status, 'ready');
       assert.equal(coding.plans[0].name, 'GLM Coding Plan 优享体验卡');
       assert.deepEqual(coding.plans[0].items.map((item) => item.remainingPercent), [100, 94, 100]);
       assert.ok(!JSON.stringify(refreshed).includes(`onboard-${provider}-raw`));
+      assert.ok(!JSON.stringify(refreshed).includes(`discovered-${provider}-secret`));
       await assert.rejects(api(pollPath), (error) => error.status === 410 && /flow 不存在/.test(error.message));
     });
   }
