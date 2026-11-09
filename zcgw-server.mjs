@@ -31,6 +31,10 @@ const GATEWAY_KEY = process.env.GATEWAY_KEY || '';
 // 面板访问控制：设置 PANEL_KEY 后，除 /health、/v1/*、登录接口外的所有请求都要带会话 cookie。
 // 不设置则完全不拦截（本机/内网模式），不影响现有部署。
 const PANEL_KEY = process.env.PANEL_KEY || '';
+// 服务间管理令牌：供统一 panel2api 面板调用。设置后，携带
+// `Authorization: Bearer <PLATFORM_TOKEN>` 的请求无需面板 cookie 即可访问管理端点。
+// 未设置时该分支完全关闭，行为与之前一致。
+const PLATFORM_TOKEN = process.env.PLATFORM_TOKEN || '';
 const PANEL_COOKIE = 'zcgw_panel';
 const PANEL_TTL_MS = 7 * 86400_000;
 
@@ -51,8 +55,21 @@ function panelAuthed(req) {
     return false;
   }
 }
-const UPSTREAM_ORIGIN = process.env.ZCODE_UPSTREAM_ORIGIN || 'https://zcode.z.ai';
-const UPSTREAM_URL = `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`;
+// 服务间管理令牌校验：常量时间比较，未配置或长度不足时直接拒绝。
+function serviceAuthed(req) {
+  if (!PLATFORM_TOKEN || PLATFORM_TOKEN.length < 12) return false;
+  const m = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  if (!m) return false;
+  const supplied = Buffer.from(m[1].trim());
+  const expected = Buffer.from(PLATFORM_TOKEN);
+  if (supplied.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(supplied, expected);
+  } catch {
+    return false;
+  }
+}
+const UPSTREAM_ORIGIN = process.env.ZCODE_UPSTREAM_ORIGIN || 'https://zcode.z.ai';const UPSTREAM_URL = `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`;
 const DEFAULT_MODEL = process.env.ZCODE_MODEL || 'GLM-5.3-Flash';
 const VERBOSE = process.env.ZCGW_VERBOSE === '1';
 const PROFILE_FILE = path.join(import.meta.dirname, 'zcode-profile.json');
@@ -3067,10 +3084,10 @@ const server = http.createServer((req, res) => {
       res.setHeader('set-cookie', `${PANEL_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
       return sendJson(res, 200, { ok: true });
     }
-    const authed = panelAuthed(req);
+    const authed = panelAuthed(req) || serviceAuthed(req);
     // 未登录返回 401：前端 establishSession() 靠抛异常进入登录页（cnb2api 同款契约）
     if (!authed) return sendJson(res, 401, { authenticated: false, error: '面板未登录', code: 'panel_auth' });
-    return sendJson(res, 200, { authenticated: true, user: { name: '管理员', email: '', picture: '', provider: 'key' } });
+    return sendJson(res, 200, { authenticated: true, user: { name: '管理员', email: '', picture: '', provider: serviceAuthed(req) ? 'token' : 'key' } });
   }
   if (url.pathname === '/panel/state') {
     return sendJson(res, 200, { authRequired: !!PANEL_KEY, authed: panelAuthed(req) });
@@ -3087,7 +3104,7 @@ const server = http.createServer((req, res) => {
     url.pathname === '/api/auth/config' ||
     url.pathname.startsWith('/api/session') ||
     url.pathname.startsWith('/panel/session');
-  if (PANEL_KEY && !dataPlane && !panelAuthed(req)) {
+  if (PANEL_KEY && !dataPlane && !panelAuthed(req) && !serviceAuthed(req)) {
     return sendJson(res, 401, { error: '面板未登录或会话已过期', code: 'panel_auth' });
   }
   // ── 控制台 API（/api 前缀）──
