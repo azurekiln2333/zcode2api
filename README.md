@@ -132,10 +132,10 @@ Watchtower 配置与 `cnb2api-panel` 一致，使用 `nickfedor/watchtower:1.23.
 ```dotenv
 ZCGW_IMAGE=ghcr.io/azurekiln2333/zcode2api:latest
 WATCHTOWER_POLL_INTERVAL=600
-PORT=8787
+PANEL_ADMIN_KEY=change-me-to-a-long-secret
 ```
 
-检查间隔以秒为单位。已有部署使用 `12283` 时，把 `PORT` 设为 `12283`，端口映射、容器监听和健康检查会使用同一端口。
+检查间隔以秒为单位。镜像默认监听 `12283`，并自带健康检查（按 `PORT` 探测 `/health`）；端口映射固定为 `12283:12283`，需要换端口时同时修改 compose 的映射与 `PORT`。
 固定版本标签（如 `ZCGW_IMAGE=ghcr.io/azurekiln2333/zcode2api:v1.1.8`）不会自动切换到下一个版本标签。
 
 已有部署需要先同步新版 `docker-compose.yml`，保留原有端口、环境变量和数据挂载，再执行一次：
@@ -163,7 +163,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 ```bash
 # 端口只绑本机：公网访问请走反向代理（HTTPS + 访问控制），直接暴露管理面风险高
-docker run -d --name zcode2api -p 127.0.0.1:8787:8787 -v /opt/zcode2api/data:/app/data ghcr.io/azurekiln2333/zcode2api:latest
+docker run -d --name zcode2api -p 127.0.0.1:12283:12283 -v /opt/zcode2api/data:/app/data ghcr.io/azurekiln2333/zcode2api:latest
 ```
 
 ### 裸机
@@ -185,7 +185,7 @@ ZCGW_BROWSER_CDP_URL: "http://browser-host:9222" # 也支持 ws:// 或 wss:// �
 
 **从 v1.1.13 / v1.1.14 升级**：默认镜像已移除内置 Chromium。原有定时设置和领取记录保留，自动验证改用在线面板；若需要持续无人值守，请配置上述外部连接。zcode-switch 使用系统 WebView，自动领取同样需要桌面程序保持运行。
 
-启动后浏览器打开 `http://<IP>:8787/`：
+启动后浏览器打开 `http://<IP>:12283/`：
 
 1. **账号页** → 登录 ZCode 账号（设备授权流，或粘贴客户端 Token）→ 自动识别身份 → 刷新资格 → 选择套餐并完成人机验证
 2. **密钥页** → 新建一把 key（完整 key 只显示一次，立即复制）
@@ -204,7 +204,7 @@ ZCGW_BROWSER_CDP_URL: "http://browser-host:9222" # 也支持 ws:// 或 wss:// �
 
 ```jsonc
 {
-  "baseUrl": "http://127.0.0.1:8787",     // 不带 /v1 后缀
+  "baseUrl": "http://127.0.0.1:8787",     // 不带 /v1 后缀；Docker 镜像默认端口是 12283
   "apiKey": "zck_面板上建的那把",
   "models": ["GLM-5.3-Flash", "GLM-5.3"]
 }
@@ -217,7 +217,7 @@ ZCGW_BROWSER_CDP_URL: "http://browser-host:9222" # 也支持 ws:// 或 wss:// �
 <summary><b>OpenAI 风格（ChatBox、NextChat、LobeChat、Open WebUI 等）</b></summary>
 
 ```
-Base URL:  http://127.0.0.1:8787/v1        # OpenAI 风格带 /v1
+Base URL:  http://127.0.0.1:12283/v1        # OpenAI 风格带 /v1
 API Key:   zck_xxxxxxxx
 Model:     GLM-5.3-Flash
 ```
@@ -228,12 +228,12 @@ Model:     GLM-5.3-Flash
 
 ```bash
 # Anthropic 风格
-curl http://127.0.0.1:8787/v1/messages \
+curl http://127.0.0.1:12283/v1/messages \
   -H "x-api-key: zck_xxx" -H "content-type: application/json" \
   -d '{"model":"GLM-5.3-Flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 
 # OpenAI 风格
-curl http://127.0.0.1:8787/v1/chat/completions \
+curl http://127.0.0.1:12283/v1/chat/completions \
   -H "Authorization: Bearer zck_xxx" -H "content-type: application/json" \
   -d '{"model":"GLM-5.3-Flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -326,12 +326,33 @@ v1.1.7 的账号页改为先查看「活动与套餐详情」弹窗，再领取�
 
 ---
 
+## 登录与 SSO
+
+控制台支持两种登录方式，任选其一或都用，设置保存在数据目录，改完立即生效，无需重启。
+
+| 方式 | 说明 |
+|---|---|
+| 管理密钥 | 设置 `PANEL_ADMIN_KEY`（旧名 `PANEL_KEY`）后，用同一把密钥登录任一控制台 |
+| OIDC SSO | 在「登录与 SSO」页填写颁发者、客户端 ID/密钥与管理员白名单后启用 |
+
+同一把 `PANEL_ADMIN_KEY` 也是管理接口的 bearer：统一平台面板用
+`Authorization: Bearer <PANEL_ADMIN_KEY>` 调用本服务，无需额外的服务间令牌变量。
+关闭密钥登录后这条通路仍然有效，方便服务间调用不中断。
+
+- 两种方式不能同时关闭，否则会锁死控制台。
+- 关闭密钥登录前，必须先用 SSO 登录验证一次（同一套配置）。
+- 邮箱白名单只认提供方标记为已验证的邮箱。
+- OIDC 相关变量都不是必填项；单独域名部署时设置 `PANEL_PUBLIC_URL`，用它推导回调地址。
+
+---
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `HOST` / `PORT` | `0.0.0.0` / `8787` | 监听地址 |
-| `GATEWAY_KEY` | 空 | 主密钥（面板密钥之外的备份通道） |
+| `HOST` / `PORT` | `0.0.0.0` / `12283` | 监听地址（镜像默认 12283） |
+| `PANEL_ADMIN_KEY` | 空 | 面板管理密钥：控制台登录 + 管理接口 bear，至少 12 位；旧名 `PANEL_KEY` 仍可用 |
+| `PANEL_PUBLIC_URL` | 空 | 面板对外地址，用于推导 SSO 回调地址 |
 | `ZCGW_DATA_DIR` | 程序目录 | 数据目录（Docker 里指 `/app/data`） |
 | `ZCGW_MAX_INFLIGHT` | `5` | 单号在途上限 |
 | `ZCGW_TOPN` | `3` | 加权随机候选窗口 |
@@ -340,8 +361,9 @@ v1.1.7 的账号页改为先查看「活动与套餐详情」弹窗，再领取�
 | `ZCGW_QUOTA_COOLDOWN_MS` | `1800000` | 限流惯犯冷却 |
 | `ZCGW_BLOCKED_COOLDOWN_MS` | `600000` | 风控冷却 |
 | `ZCGW_BREAKER_THRESHOLD` | `3` | 熔断连败阈值 |
-| `ZCODE_UPSTREAM_ORIGIN` | `https://zcode.z.ai` | 上游地址 |
 | `ZCODE_EXTRA_MODELS` | 空 | 额外模型 id（逗号分隔，进 `/v1/models`） |
+| `ZCODE_UPSTREAM_ORIGIN` | `https://zcode.z.ai` | 上游地址（一般不用改，代码内已有默认值） |
+| `ZCODE_MODEL` | `GLM-5.3-Flash` | 默认模型（代码内已有默认值） |
 
 ---
 
@@ -367,6 +389,7 @@ v1.1.7 的账号页改为先查看「活动与套餐详情」弹窗，再领取�
 - 密钥只在创建时显示一次，库里只存 SHA-256 哈希；账号凭据不返回前端
 - 存在 ≥1 把密钥即强制鉴权；**删光密钥只放行 `127.0.0.1`**（openMode 防裸奔设计），外部一律 401
 - 入站 IP 黑 / 白名单（支持 IPv4/IPv6 CIDR）；拦截审计保留 IP / 路径 / UA / 原因
+- 面板管理密钥可同时作为管理接口 bearer（`Authorization: Bearer <key>`），数据面 `/v1/*` 不受影响
 - 每次请求留痕来源 IP 与 User-Agent（仅元数据，**不记录对话内容**）
 - 敏感文件建议 `chmod 600` + 独立系统用户运行（Docker 镜像已用非 root 用户）
 
