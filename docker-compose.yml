@@ -17,11 +17,11 @@ services:
     container_name: zcgw
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT:-8787}:${PORT:-8787}"   # 只本机 nginx 反代；已有部署可在 .env 中设置 PORT=12283
+      - "127.0.0.1:${PORT:-12283}:${PORT:-12283}"   # 只本机 nginx 反代；已有部署可在 .env 中设置 PORT=12283
     environment:
       # 监听容器内 0.0.0.0（必须，docker 端口映射依赖它）
       HOST: 0.0.0.0
-      PORT: "${PORT:-8787}"
+      PORT: "${PORT:-12283}"
       # 可选：主密钥（面板密钥之外的后门 key）；一般留空用面板建的 key
       GATEWAY_KEY: ""
       # 可选：面板登录口令 —— 设置后面板需密钥登录（7 天会话），数据面 /v1/* 不受影响；
