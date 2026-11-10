@@ -41,6 +41,13 @@ test('the auth modules are shipped into the runtime image', () => {
   }
 });
 
+test('the release image check probes the port the image listens on', () => {
+  // A hard-coded 8787 here broke the v1.2.0 release job after the default moved.
+  const script = read('scripts/ci-image.sh');
+  assert.match(script, /process\.env\.PORT/);
+  assert.doesNotMatch(script, /127\.0\.0\.1:8787/);
+});
+
 test('the shipped compose no longer requires the dropped variables', () => {
   for (const file of ['docker-compose.yml', 'docker-compose.build.yml']) {
     const compose = read(file);

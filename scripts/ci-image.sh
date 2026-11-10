@@ -19,7 +19,7 @@ container="$(docker run -d "$IMAGE")"
 cleanup() { docker logs "$container"; docker rm -f "$container" >/dev/null; }
 trap cleanup EXIT
 for i in $(seq 1 30); do
-  if docker exec "$container" node -e "fetch('http://127.0.0.1:8787/health').then(async r=>{if(!r.ok)process.exit(1);console.log(await r.text())}).catch(()=>process.exit(1))"; then
+  if docker exec "$container" node -e "fetch('http://127.0.0.1:'+(process.env.PORT||12283)+'/health').then(async r=>{if(!r.ok)process.exit(1);console.log(await r.text())}).catch(()=>process.exit(1))"; then
     exit 0
   fi
   sleep 1
