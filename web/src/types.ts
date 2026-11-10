@@ -345,4 +345,4 @@ export interface SessionUser {
 
 export type LogChannel = 'requests'
 export type Page =
-  | 'accounts' | 'overview' | 'models' | 'routing' | 'activity' | 'access'
+  | 'accounts' | 'overview' | 'models' | 'routing' | 'activity' | 'access' | 'security'

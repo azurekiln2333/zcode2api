@@ -34,6 +34,7 @@ import RoutingView from './views/RoutingView.vue'
 import ActivityView from './views/ActivityView.vue'
 import AccessView from './views/AccessView.vue'
 import ModelsView from './views/ModelsView.vue'
+import SsoSettingsView from './views/SsoSettingsView.vue'
 import ModalShell from './components/ModalShell.vue'
 
 const appVersion = __APP_VERSION__
@@ -72,6 +73,7 @@ const nav = [
   { id: 'routing', label: '网关设置', icon: Waypoints },
   { id: 'activity', label: '请求日志', icon: ScrollText },
   { id: 'access', label: '接入配置', icon: Braces },
+  { id: 'security', label: '登录与 SSO', icon: ShieldCheck },
 ] as const
 const initialPage = location.hash.slice(1)
 const page = ref<Page>(nav.some((n) => n.id === initialPage) ? (initialPage as Page) : 'accounts')
@@ -79,6 +81,7 @@ const title = computed(() => nav.find((n) => n.id === page.value)?.label)
 const authenticated = ref(false)
 const checkingSession = ref(true)
 const loginKey = ref('')
+const ssoError = new URLSearchParams(location.search).get('auth_error') || ''
 const loginError = ref('')
 const signingIn = ref(false)
 const authConfig = ref<AuthConfig>(DEFAULT_AUTH_CONFIG)
@@ -93,7 +96,24 @@ let poll: number | undefined
 let browserPoll: number | undefined
 let lastLifecycleRefresh = -Infinity
 
-const loginHint = computed(() => '使用主机上配置的管理密钥登录。')
+// SSO 回跳失败时服务端会带上 ?auth_error=xxx，登录页直接告知原因。
+const AUTH_ERRORS: Record<string, string> = {
+  sso_disabled: 'SSO 已关闭，请使用管理密钥登录。',
+  discovery_failed: '无法连接 SSO 提供方，请检查颁发者地址。',
+  transaction_expired: '登录超时，请重新发起。',
+  state_mismatch: '登录状态校验失败，请重试。',
+  not_allowed: '当前账号不在管理员白名单中。',
+  userinfo_mismatch: 'SSO 返回的身份信息不一致，已拒绝登录。',
+  provider_error: 'SSO 提供方返回了错误。',
+}
+const ssoErrorText = computed(() =>
+  ssoError ? AUTH_ERRORS[ssoError] || 'SSO 登录失败，请重试。' : '',
+)
+const loginHint = computed(() =>
+  authConfig.value.sso.enabled
+    ? '使用管理密钥或单点登录进入控制台。'
+    : '使用主机上配置的管理密钥登录。',
+)
 const userInitial = computed(() => {
   const name = sessionUser.value?.name.trim()
   return name ? Array.from(name)[0]!.toUpperCase() : ''
@@ -282,6 +302,7 @@ onBeforeUnmount(() => {
         ><span class="eyebrow">GATEWAY CONSOLE</span>
         <h2>欢迎回到控制台</h2>
         <p>{{ loginHint }}</p>
+        <p v-if="ssoErrorText" class="form-error" role="alert">{{ ssoErrorText }}</p>
         <template v-if="authConfig.keyLoginEnabled">
           <label for="admin-key"
             >管理密钥<input
@@ -291,7 +312,7 @@ onBeforeUnmount(() => {
               required
               autofocus
               autocomplete="current-password"
-              placeholder="输入 PANEL_KEY"
+              placeholder="输入 PANEL_ADMIN_KEY"
           /></label>
           <p v-if="loginError" class="form-error" role="alert">{{ loginError }}</p>
           <button class="button primary login-submit" :disabled="signingIn">
@@ -302,8 +323,16 @@ onBeforeUnmount(() => {
           </button>
         </template>
         <p v-else class="form-error" role="alert">
-          登录方式未配置，请在服务器环境变量中设置 PANEL_KEY。
+          登录方式未配置，请在服务器环境变量中设置 PANEL_ADMIN_KEY，或在服务器上启用 SSO。
         </p>
+        <template v-if="authConfig.sso.enabled && authConfig.sso.loginUrl">
+          <div class="login-divider"><span>或</span></div>
+          <a class="button login-sso" :href="authConfig.sso.loginUrl">
+            <ShieldCheck :size="17" /><span
+              >使用 {{ authConfig.sso.providerName || 'SSO' }} 登录</span
+            >
+          </a>
+        </template>
       </form>
     </main>
   </div>
@@ -432,6 +461,8 @@ onBeforeUnmount(() => {
         </div>
         <ActivityView v-if="page === 'activity'" :key="page" channel="requests" />
         <ModelsView v-else-if="page === 'models'" />
+        <!-- 登录/SSO 设置不依赖账号池，单独渲染，overview 拉取失败时也能打开 -->
+        <SsoSettingsView v-else-if="page === 'security'" />
         <div v-else-if="!overview && loading" class="page-loading">
           <LoaderCircle :size="24" class="spin" /><span>正在读取账号池…</span>
         </div>
