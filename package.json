@@ -5,7 +5,7 @@
   "description": "zcgw — ZCode 多账号反代网关与每日定时领取",
   "type": "module",
   "scripts": {
-    "check": "node --check zcgw-server.mjs && node --check zcgw-fingerprint.mjs && node --check zcgw-quota.mjs && node --check zcgw-coding.mjs && node --check zcgw-claim.mjs && node --check zcgw-upstream.mjs && node --check zcgw-version.mjs && node --check zcgw-auto-claim.mjs && node --check zcgw-captcha-browser.mjs && node --check zcgw-captcha-panel.mjs && node scripts/check-version.mjs",
+    "check": "node --check zcgw-server.mjs && node --check zcgw-fingerprint.mjs && node --check zcgw-quota.mjs && node --check zcgw-coding.mjs && node --check zcgw-claim.mjs && node --check zcgw-upstream.mjs && node --check zcgw-version.mjs && node --check zcgw-auto-claim.mjs && node --check zcgw-captcha-browser.mjs && node --check zcgw-captcha-panel.mjs && node --check zcgw-oidc.mjs && node --check zcgw-sso.mjs && node scripts/check-version.mjs",
     "start": "node zcgw-server.mjs",
     "ci": "bash scripts/ci-backend.sh",
     "test": "node --test tests/*.test.mjs"

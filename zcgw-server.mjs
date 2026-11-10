@@ -25,56 +25,231 @@ import { createPanelCaptcha } from './zcgw-captcha-panel.mjs';
 import { zcodeRequest, responseJson } from './zcgw-upstream.mjs';
 import { billingHeaders, parseClaimPlan, parseMarketingPlans, mergeClaimPlans, parseCurrentPlans, effectiveAt, claimFailure } from './zcgw-claim.mjs';
 import { metadataUserId, sessionIdFor, requestId, userIdFromJwt, deviceIdFor } from './zcgw-fingerprint.mjs';
+import {
+  OidcError,
+  buildAuthorizationUrl,
+  createTransaction,
+  discoverProvider,
+  exchangeAuthorizationCode,
+  fetchUserInfo,
+  identityFromClaims,
+  isAllowed,
+  safeEqual,
+  verifyIdTokenForConfig,
+} from './zcgw-oidc.mjs';
+import { InputError, sanitizeSso, validateSso, withSsoDefaults } from './zcgw-sso.mjs';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const GATEWAY_KEY = process.env.GATEWAY_KEY || '';
-// 面板访问控制：设置 PANEL_KEY 后，除 /health、/v1/*、登录接口外的所有请求都要带会话 cookie。
-// 不设置则完全不拦截（本机/内网模式），不影响现有部署。
-const PANEL_KEY = process.env.PANEL_KEY || '';
-// 服务间管理令牌：供统一 panel2api 面板调用。设置后，携带
-// `Authorization: Bearer <PLATFORM_TOKEN>` 的请求无需面板 cookie 即可访问管理端点。
-// 未设置时该分支完全关闭，行为与之前一致。
+// 面板访问控制：设置 PANEL_ADMIN_KEY（旧名 PANEL_KEY 仍可用）后，除 /health、/v1/*、
+// 登录相关接口外的所有请求都要带会话 cookie 或管理 bearer。两者都不设置且未启用 SSO
+// 时完全不拦截（本机/内网模式），不影响现有部署。
+const PANEL_ADMIN_KEY = process.env.PANEL_ADMIN_KEY || process.env.PANEL_KEY || '';
+// 面板对外的公网地址（带或不带路径均可，只取 origin 部分）。设置后 SSO 回调地址
+// 由它推导，否则按请求的 Host 推导。
+const PANEL_PUBLIC_URL = process.env.PANEL_PUBLIC_URL || '';
+// 服务间管理令牌：旧部署仍可用 `Authorization: Bearer <PLATFORM_TOKEN>`。
+// 新部署直接用面板管理密钥，不再需要额外的变量。
 const PLATFORM_TOKEN = process.env.PLATFORM_TOKEN || '';
 const PANEL_COOKIE = 'zcgw_panel';
 const PANEL_TTL_MS = 7 * 86400_000;
+const OIDC_COOKIE = 'zcgw_oidc';
+const OIDC_TRANSACTION_MS = 10 * 60 * 1000;
+// 允许 http://127.0.0.1 这类回环地址作为 issuer（仅供本机 mock 与测试；默认关闭）
+const allowLocal = process.env.ZCGW_SSO_ALLOW_LOCAL === '1';
 
-function panelSign(expiresAt) {
-  return crypto.createHmac('sha256', PANEL_KEY).update(`zcgw-panel:${expiresAt}`).digest('base64url');
+const ssoState = () => authState.sso;
+/** 面板是否需要登录：配置了管理密钥或启用了 SSO。 */
+const authEnabled = () => Boolean(PANEL_ADMIN_KEY) || ssoState().enabled;
+
+// 密钥登录的会话额外绑定当前管理密钥：轮换 key 后旧 cookie 立即失效
+// （与 main 分支用 PANEL_KEY 做 HMAC 密钥的效果一致）。SSO 会话不绑定它，
+// 因为 SSO 会话的生命周期由 SSO 配置指纹控制。
+const keyBinding = () =>
+  PANEL_ADMIN_KEY
+    ? crypto.createHash('sha256').update(`zcgw-key:${PANEL_ADMIN_KEY}`).digest('base64url')
+    : '-';
+
+function panelSign(expiresAt, provider = 'key', fingerprint = '') {
+  return crypto
+    .createHmac('sha256', authState.sessionSecret)
+    .update(`zcgw-panel:${expiresAt}:${provider}:${fingerprint}:${provider === 'key' ? keyBinding() : '-'}`)
+    .digest('base64url');
+}
+
+/** 会话载荷：<过期时间>.<来源 key|oidc>.<SSO 配置指纹>.<签名> */
+function sessionPayload(expiresAt, provider = 'key', fingerprint = '') {
+  const fp = provider === 'oidc' ? fingerprint : '-';
+  return {
+    expiresAt,
+    provider,
+    fingerprint,
+    value: `${expiresAt}.${provider}.${fp}.${panelSign(expiresAt, provider, fingerprint)}`,
+  };
+}
+
+function cookieValue(req, name) {
+  const m = String(req.headers.cookie || '').match(new RegExp(`(?:^|;\\s*)${name}=([A-Za-z0-9._-]+)`));
+  return m ? m[1] : '';
+}
+
+/** 解析会话 cookie；返回 { provider, fingerprint } 或 null */
+function sessionOf(req) {
+  const raw = cookieValue(req, PANEL_COOKIE);
+  if (!raw) return null;
+  const parts = raw.split('.');
+  if (parts.length !== 4) return null;
+  const [expStr, provider, fp, sig] = parts;
+  const expiresAt = Number(expStr);
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return null;
+  if (provider !== 'key' && provider !== 'oidc') return null;
+  const fingerprint = provider === 'oidc' && fp !== '-' ? fp : '';
+  const expected = Buffer.from(panelSign(expiresAt, provider, fingerprint));
+  const supplied = Buffer.from(sig);
+  if (supplied.length !== expected.length) return null;
+  try {
+    if (!crypto.timingSafeEqual(supplied, expected)) return null;
+  } catch {
+    return null;
+  }
+  return { provider, fingerprint };
 }
 
 function panelAuthed(req) {
-  if (!PANEL_KEY) return true;
-  const m = String(req.headers.cookie || '').match(new RegExp(`(?:^|;\\s*)${PANEL_COOKIE}=([A-Za-z0-9._-]+)`));
-  if (!m) return false;
-  const [expStr, sig] = m[1].split('.');
-  const exp = Number(expStr);
-  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  return sessionOf(req) !== null;
+}
+
+function safeEqualText(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) return false;
   try {
-    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(panelSign(exp)));
+    return crypto.timingSafeEqual(left, right);
   } catch {
     return false;
   }
 }
-// 服务间管理令牌校验：常量时间比较，未配置或长度不足时直接拒绝。
+
+// 管理 bearer：面板管理密钥，或旧的 PLATFORM_TOKEN。常量时间比较；
+// 面板密钥即使关闭了密钥登录也依然有效（服务间调用路径）。
 function serviceAuthed(req) {
-  if (!PLATFORM_TOKEN || PLATFORM_TOKEN.length < 12) return false;
   const m = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
   if (!m) return false;
-  const supplied = Buffer.from(m[1].trim());
-  const expected = Buffer.from(PLATFORM_TOKEN);
-  if (supplied.length !== expected.length) return false;
-  try {
-    return crypto.timingSafeEqual(supplied, expected);
-  } catch {
-    return false;
-  }
+  const supplied = m[1].trim();
+  if (!supplied) return false;
+  if (PANEL_ADMIN_KEY.length >= 12 && safeEqualText(supplied, PANEL_ADMIN_KEY)) return true;
+  if (PLATFORM_TOKEN.length >= 12 && safeEqualText(supplied, PLATFORM_TOKEN)) return true;
+  return false;
 }
+
+function isSecureRequest(req) {
+  if (PANEL_PUBLIC_URL) {
+    try {
+      return new URL(PANEL_PUBLIC_URL).protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+  return Boolean(req.socket && req.socket.encrypted);
+}
+
+function requestOrigin(req) {
+  if (PANEL_PUBLIC_URL) {
+    try {
+      return new URL(PANEL_PUBLIC_URL).origin;
+    } catch {
+      // 配错时退回到请求头推导，避免整个面板不可用
+    }
+  }
+  return `${isSecureRequest(req) ? 'https' : 'http'}://${req.headers.host || 'localhost'}`;
+}
+
+const ssoCallbackUrl = (req) => ssoState().callbackUrl || `${requestOrigin(req)}/api/auth/oidc/callback`;
+const ssoFingerprint = (sso) =>
+  crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify([
+        sso.issuer,
+        sso.clientId,
+        sso.clientSecret,
+        sso.scope,
+        sso.allowedSubjects,
+        sso.allowedEmails,
+        sso.callbackUrl,
+      ]),
+    )
+    .digest('base64url');
+
+const oidcTransactions = new Map();
+// 状态：给前端渲染登录页和 SSO 设置页；密钥永不返回。
+function authSettingsView(callbackUrl) {
+  return sanitizeSso(ssoState(), callbackUrl);
+}
+
+function authConfigView() {
+  const sso = ssoState();
+  return {
+    keyLoginEnabled: sso.keyLoginEnabled,
+    sso: {
+      enabled: sso.enabled,
+      providerName: sso.providerName || 'SSO',
+      loginUrl: sso.enabled ? '/api/auth/oidc/login' : '',
+    },
+  };
+}
+
 const UPSTREAM_ORIGIN = process.env.ZCODE_UPSTREAM_ORIGIN || 'https://zcode.z.ai';const UPSTREAM_URL = `${UPSTREAM_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`;
 const DEFAULT_MODEL = process.env.ZCODE_MODEL || 'GLM-5.3-Flash';
 const VERBOSE = process.env.ZCGW_VERBOSE === '1';
 const PROFILE_FILE = path.join(import.meta.dirname, 'zcode-profile.json');
 // 数据文件目录：Docker 里指向挂载卷 /app/data，本机默认与程序同目录
 const DATA_DIR = process.env.ZCGW_DATA_DIR || import.meta.dirname;
+
+const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+
+/** 管理器生成的会话签名密钥：与面板管理密钥解耦，密钥轮换不会踢掉会话。 */
+function newSessionSecret() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function readAuthFile() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// 设置持久化在数据目录里，重启不丢；写入用临时文件 + rename，避免半截 JSON。
+const authState = (() => {
+  const stored = readAuthFile();
+  return {
+    sso: withSsoDefaults(stored.sso),
+    sessionSecret:
+      typeof stored.sessionSecret === 'string' && stored.sessionSecret.length >= 32
+        ? stored.sessionSecret
+        : newSessionSecret(),
+  };
+})();
+
+function saveAuthState() {
+  const payload = JSON.stringify(authState, null, 2);
+  const temp = `${AUTH_FILE}.tmp`;
+  fs.writeFileSync(temp, payload, { mode: 0o600 });
+  fs.renameSync(temp, AUTH_FILE);
+}
+
+// 首次启动时把会话密钥落盘，之后一直复用。
+if (!readAuthFile().sessionSecret) {
+  try {
+    saveAuthState();
+  } catch (error) {
+    console.warn(`[auth] 无法写入 ${AUTH_FILE}：${error.message}，本次运行的会话在重启后失效`);
+  }
+}
 const clientVersion = createVersionManager({ dataDir: DATA_DIR,
   url: process.env.ZCODE_CHANGELOG_URL || `${UPSTREAM_ORIGIN}/cn/changelog`, configuredVersion: process.env.ZCODE_APP_VERSION });
 
@@ -2622,22 +2797,232 @@ async function handleSecurityUpdate(req, res) {
   sendJson(res, 200, { ok: true, ...out, security: { enabled: security.enabled, mode: security.mode, rules: security.rules } });
 }
 
-/** 面板登录：POST { key } —— 与 PANEL_KEY 恒等比较，通过后签发 7 天会话 cookie */
+// 登录失败限流：同一来源 10 分钟内连续失败 5 次后暂停尝试，防止在线爆破
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 5;
+const loginFailures = new Map();
+
+// 限流只认 socket 真实地址：x-forwarded-for 客户端可伪造，换一个值就能绕过。
+const clientIpOf = (req) =>
+  (req.socket && req.socket.remoteAddress) || 'unknown';
+
+function loginAllowed(ip) {
+  const record = loginFailures.get(ip);
+  if (!record) return true;
+  if (record.resetAt <= Date.now()) {
+    loginFailures.delete(ip);
+    return true;
+  }
+  return record.count < LOGIN_MAX_FAILURES;
+}
+
+function recordLoginFailure(ip) {
+  const now = Date.now();
+  const record = loginFailures.get(ip);
+  if (!record || record.resetAt <= now) {
+    loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return;
+  }
+  record.count += 1;
+}
+
+function sessionCookie(req, expiresAt, provider = 'key', fingerprint = '') {
+  const maxAge = Math.floor((expiresAt - Date.now()) / 1000);
+  const { value } = sessionPayload(expiresAt, provider, fingerprint);
+  return `${PANEL_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${isSecureRequest(req) ? '; Secure' : ''}`;
+}
+
+const clearedSessionCookie = (req) =>
+  `${PANEL_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isSecureRequest(req) ? '; Secure' : ''}`;
+
+/** 面板登录：POST { key } —— 常量时间比较，通过后签发 7 天会话 cookie */
 async function handlePanelLogin(req, res) {
+  if (!ssoState().keyLoginEnabled)
+    return sendJson(res, 403, { error: '管理密钥登录已停用，请使用单点登录', code: 'panel_auth' });
+  if (!PANEL_ADMIN_KEY)
+    return sendJson(res, 400, { error: '未设置 PANEL_ADMIN_KEY，面板处于免登录模式', code: 'panel_auth' });
+  const ip = clientIpOf(req);
+  if (!loginAllowed(ip)) {
+    res.setHeader('retry-after', '600');
+    return sendJson(res, 429, { error: '登录尝试过多，请 10 分钟后重试', code: 'panel_auth' });
+  }
   const raw = await readBody(req);
   let body = {};
   try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
   const key = String(body.key || '');
-  if (!PANEL_KEY) return sendJson(res, 400, { error: '未设置 PANEL_KEY，面板处于免登录模式' });
-  let ok = false;
-  try {
-    ok = key.length === PANEL_KEY.length && crypto.timingSafeEqual(Buffer.from(key), Buffer.from(PANEL_KEY));
-  } catch {}
-  if (!ok) return sendJson(res, 401, { error: '管理密钥不正确', code: 'panel_auth' });
+  if (!safeEqualText(key, PANEL_ADMIN_KEY)) {
+    recordLoginFailure(ip);
+    return sendJson(res, 401, { error: '管理密钥不正确', code: 'panel_auth' });
+  }
+  loginFailures.delete(ip);
   const exp = Date.now() + PANEL_TTL_MS;
-  res.setHeader('set-cookie', `${PANEL_COOKIE}=${exp}.${panelSign(exp)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(PANEL_TTL_MS / 1000)}`);
+  res.setHeader('set-cookie', sessionCookie(req, exp));
   log('面板登录成功');
-  return sendJson(res, 200, { ok: true });
+  return sendJson(res, 200, { authenticated: true, user: { name: '管理员', email: '', picture: '', provider: 'key' } });
+}
+
+const oidcCookie = (req, value, age) =>
+  `${OIDC_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}${isSecureRequest(req) ? '; Secure' : ''}`;
+
+const safeReason = (error) =>
+  error instanceof OidcError && /^[a-z_]+$/.test(error.reason) ? error.reason : 'internal_error';
+
+function pruneTransactions() {
+  const now = Date.now();
+  for (const [id, tx] of oidcTransactions) if (tx.expiresAt <= now) oidcTransactions.delete(id);
+  if (oidcTransactions.size >= 500) oidcTransactions.delete(oidcTransactions.keys().next().value);
+}
+
+const redirectTo = (res, location, headers = {}) => {
+  res.writeHead(302, { location, 'cache-control': 'no-store', ...headers });
+  res.end();
+};
+
+/** SSO 登录入口：发现 issuer -> 建 state/nonce/PKCE -> 302 到 IdP */
+async function handleSsoLogin(req, res) {
+  const sso = ssoState();
+  if (!sso.enabled) return redirectTo(res, '/?auth_error=sso_disabled');
+  let discovery;
+  try {
+    discovery = await discoverProvider(sso, { allowLocal });
+  } catch {
+    return redirectTo(res, '/?auth_error=discovery_failed');
+  }
+  pruneTransactions();
+  const tx = createTransaction();
+  const redirectUri = ssoCallbackUrl(req);
+  oidcTransactions.set(tx.txid, {
+    state: tx.state,
+    nonce: tx.nonce,
+    verifier: tx.verifier,
+    redirectUri,
+    expiresAt: Date.now() + OIDC_TRANSACTION_MS,
+  });
+  const location = buildAuthorizationUrl(sso, {
+    redirectUri,
+    state: tx.state,
+    nonce: tx.nonce,
+    codeChallenge: tx.challenge,
+    authorizationEndpoint: discovery.authorizationEndpoint,
+  });
+  return redirectTo(res, location, {
+    'set-cookie': oidcCookie(req, tx.txid, OIDC_TRANSACTION_MS / 1000),
+  });
+}
+
+/** SSO 回调：校 state -> 换 token -> 验 ID token -> 白名单 -> 发会话 */
+async function handleSsoCallback(req, res, url) {
+  const sso = ssoState();
+  const clearCookie = oidcCookie(req, '', 0);
+  const fail = (reason) => redirectTo(res, `/?auth_error=${reason}`, { 'set-cookie': clearCookie });
+  if (!sso.enabled) return fail('sso_disabled');
+  const txid = cookieValue(req, OIDC_COOKIE);
+  const tx = txid ? oidcTransactions.get(txid) : null;
+  if (txid) oidcTransactions.delete(txid);
+  if (!tx || tx.expiresAt <= Date.now()) return fail('transaction_expired');
+  if (url.searchParams.get('error')) return fail('provider_error');
+  if (!safeEqual(url.searchParams.get('state') || '', tx.state)) return fail('state_mismatch');
+  const code = url.searchParams.get('code') || '';
+  if (!code || code.length > 4096) return fail('missing_code');
+  let discovery;
+  let tokens;
+  try {
+    discovery = await discoverProvider(sso, { allowLocal });
+    tokens = await exchangeAuthorizationCode(sso, {
+      code,
+      codeVerifier: tx.verifier,
+      redirectUri: tx.redirectUri,
+      tokenEndpoint: discovery.tokenEndpoint,
+    });
+  } catch (error) {
+    return fail(safeReason(error));
+  }
+  let idClaims;
+  try {
+    idClaims = await verifyIdTokenForConfig(sso, tokens.id_token, { nonce: tx.nonce, allowLocal });
+  } catch (error) {
+    return fail(safeReason(error));
+  }
+  let userInfo = null;
+  try {
+    userInfo = await fetchUserInfo(discovery, tokens.access_token);
+  } catch {
+    // UserInfo 可选：验证过的 ID token 声明就是兜底
+  }
+  if (userInfo && userInfo.sub !== idClaims.sub) return fail('userinfo_mismatch');
+  let identity;
+  try {
+    identity = identityFromClaims(userInfo, idClaims);
+  } catch (error) {
+    return fail(safeReason(error));
+  }
+  if (!isAllowed(identity, sso)) return fail('not_allowed');
+  const exp = Date.now() + PANEL_TTL_MS;
+  log(`SSO 登录成功：${identity.email || identity.sub}`);
+  return redirectTo(res, '/', {
+    'set-cookie': [sessionCookie(req, exp, 'oidc', ssoFingerprint(sso)), clearCookie],
+  });
+}
+
+/** SSO 设置读写：密钥永不返回；改完立即生效，无需重启 */
+async function handleAuthSettings(req, res, url) {
+  if (req.method === 'GET') return sendJson(res, 200, authSettingsView(ssoCallbackUrl(req)));
+  if (req.method !== 'PATCH' && req.method !== 'POST') {
+    return sendJson(res, 405, { error: 'method not allowed' });
+  }
+  const raw = await readBody(req);
+  let input = {};
+  try { input = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
+  const previous = ssoState();
+  const fields = {};
+  if (input.ssoEnabled !== undefined) fields.enabled = input.ssoEnabled;
+  for (const key of [
+    'keyLoginEnabled',
+    'issuer',
+    'clientId',
+    'clientSecret',
+    'scope',
+    'providerName',
+    'allowedSubjects',
+    'allowedEmails',
+    'callbackUrl',
+  ]) {
+    if (input[key] !== undefined) fields[key] = input[key];
+  }
+  let candidate;
+  try {
+    candidate = validateSso(fields, previous, { allowLocal });
+  } catch (error) {
+    if (error instanceof InputError) return sendJson(res, error.status || 400, { error: error.message });
+    throw error;
+  }
+  // 关闭密钥登录必须证明 SSO 真的能用：当前会话需是同一套配置下的 SSO 会话
+  if (previous.keyLoginEnabled && candidate.keyLoginEnabled === false) {
+    const session = sessionOf(req);
+    if (!session || session.provider !== 'oidc' || session.fingerprint !== ssoFingerprint(candidate)) {
+      return sendJson(res, 403, { error: '请先通过 SSO 登录验证，再关闭管理密钥登录' });
+    }
+  }
+  const needsDiscovery =
+    candidate.enabled &&
+    (!previous.enabled ||
+      previous.issuer !== candidate.issuer ||
+      previous.clientId !== candidate.clientId);
+  if (needsDiscovery) {
+    try {
+      await discoverProvider(candidate, { allowLocal });
+    } catch {
+      return sendJson(res, 400, { error: 'SSO 颁发者不可用或 discovery 校验失败，请检查地址后重试' });
+    }
+  }
+  authState.sso = candidate;
+  try {
+    saveAuthState();
+  } catch (error) {
+    return sendJson(res, 500, { error: `保存 SSO 配置失败：${error.message}` });
+  }
+  log(`[auth] SSO 设置已更新：enabled=${candidate.enabled} keyLogin=${candidate.keyLoginEnabled}`);
+  return sendJson(res, 200, authSettingsView(ssoCallbackUrl(req)));
 }
 
 // ── 控制台 API（/api/*，cnb2api-console 同款契约）──
@@ -3076,23 +3461,49 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   // ── 面板控制台会话（cnb2api-console 契约 + 旧 /panel/* 兼容）──
   if (url.pathname === '/api/auth/config') {
-    return sendJson(res, 200, { keyLoginEnabled: true, sso: { enabled: false, providerName: '', loginUrl: '' } });
+    return sendJson(res, 200, authConfigView());
   }
+  if (url.pathname === '/api/auth/oidc/login' && req.method === 'GET') return handleSsoLogin(req, res);
+  if (url.pathname === '/api/auth/oidc/callback' && req.method === 'GET') return handleSsoCallback(req, res, url);
   if (url.pathname === '/api/session' || url.pathname === '/panel/session') {
     if (req.method === 'POST') return handlePanelLogin(req, res);
     if (req.method === 'DELETE') {
-      res.setHeader('set-cookie', `${PANEL_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+      res.setHeader('set-cookie', clearedSessionCookie(req));
       return sendJson(res, 200, { ok: true });
     }
-    const authed = panelAuthed(req) || serviceAuthed(req);
+    const session = sessionOf(req);
+    const machine = serviceAuthed(req);
+    // 免登录模式（既没配置管理密钥也没启用 SSO）：控制台靠这个接口判断是否
+    // 显示登录页，必须返回已认证，否则会停在永远进不去的登录页（main 同行为）。
+    if (!authEnabled()) {
+      return sendJson(res, 200, {
+        authenticated: true,
+        user: { name: '管理员', email: '', picture: '', provider: session?.provider || 'key' },
+      });
+    }
     // 未登录返回 401：前端 establishSession() 靠抛异常进入登录页（cnb2api 同款契约）
-    if (!authed) return sendJson(res, 401, { authenticated: false, error: '面板未登录', code: 'panel_auth' });
-    return sendJson(res, 200, { authenticated: true, user: { name: '管理员', email: '', picture: '', provider: serviceAuthed(req) ? 'token' : 'key' } });
+    if (!session && !machine) return sendJson(res, 401, { authenticated: false, error: '面板未登录', code: 'panel_auth' });
+    return sendJson(res, 200, {
+      authenticated: true,
+      user: { name: '管理员', email: '', picture: '', provider: machine ? 'token' : session.provider },
+    });
+  }
+  if (url.pathname === '/api/auth/settings') {
+    // 已启用鉴权时读写都必须已登录；两种方式都没配置的「开放模式」下放行，
+    // 让运维能直接在控制台里启用 SSO，而不必先往 .env 里塞变量。
+    if (authEnabled() && !panelAuthed(req) && !serviceAuthed(req)) {
+      return sendJson(res, 401, { error: '面板未登录或会话已过期', code: 'panel_auth' });
+    }
+    return handleAuthSettings(req, res, url);
   }
   if (url.pathname === '/panel/state') {
-    return sendJson(res, 200, { authRequired: !!PANEL_KEY, authed: panelAuthed(req) });
+    const required = authEnabled();
+    return sendJson(res, 200, {
+      authRequired: required,
+      authed: required ? panelAuthed(req) || serviceAuthed(req) : true,
+    });
   }
-  // ── 鉴权门：数据面永远放行，控制台其余端点在设置 PANEL_KEY 后要求登录 ──
+  // ── 鉴权门：数据面永远放行，控制台其余端点在配置管理密钥或启用 SSO 后要求登录 ──
   const dataPlane =
     url.pathname === '/health' ||
     url.pathname === '/' ||
@@ -3102,9 +3513,10 @@ const server = http.createServer((req, res) => {
     url.pathname === '/messages' ||
     url.pathname === '/chat/completions' ||
     url.pathname === '/api/auth/config' ||
+    url.pathname.startsWith('/api/auth/oidc/') ||
     url.pathname.startsWith('/api/session') ||
     url.pathname.startsWith('/panel/session');
-  if (PANEL_KEY && !dataPlane && !panelAuthed(req) && !serviceAuthed(req)) {
+  if (authEnabled() && !dataPlane && !panelAuthed(req) && !serviceAuthed(req)) {
     return sendJson(res, 401, { error: '面板未登录或会话已过期', code: 'panel_auth' });
   }
   // ── 控制台 API（/api 前缀）──
