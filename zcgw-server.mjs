@@ -3507,7 +3507,8 @@ const server = http.createServer((req, res) => {
       authed: required ? panelAuthed(req) || serviceAuthed(req) : true,
     });
   }
-  // ── 鉴权门：数据面永远放行，控制台其余端点在配置管理密钥或启用 SSO 后要求登录 ──
+  // ── 鉴权门：数据面不经面板会话（推理接口由 API 密钥单独把关），
+  //    控制台其余端点在配置管理密钥或启用 SSO 后要求登录 ──
   const dataPlane =
     url.pathname === '/health' ||
     url.pathname === '/' ||

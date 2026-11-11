@@ -157,6 +157,13 @@ test('a master key restores access without reviving an open mode',
     // Auth passes with the master key, so the request reaches the pool step.
     const accepted = await chat(base, { key: MASTER_KEY });
     assert.equal(accepted.status, 503);
+
+    // The Anthropic entry point enforces the same rule, in both header styles.
+    const anthropicAnon = await anthropic(base);
+    assert.equal(anthropicAnon.status, 401);
+    assert.equal((await anthropicAnon.json()).error.message, '缺少 API Key');
+    const anthropicAccepted = await anthropic(base, { key: MASTER_KEY });
+    assert.equal(anthropicAccepted.status, 503, 'x-api-key with the master key must authenticate');
   });
 
 test('a created key is the only credential that authorizes', { timeout: 20000 }, async (t) => {
