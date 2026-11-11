@@ -1210,7 +1210,12 @@ function secLogBlocked(req, pathname, reason, apiKeyOk) {
   saveSecurity();
 }
 
-/** 校验对外密钥；无 key 且无 GATEWAY_KEY 时放行（本机自用模式） */
+/**
+ * 校验对外密钥。
+ *
+ * 默认拒绝：既没有主密钥（GATEWAY_KEY）也没有任何启用中的密钥时，一律 401，
+ * 不存在任何放行分支；本机回环也不例外，没有环境变量或配置能恢复无鉴权调用。
+ */
 function authenticate(req, model) {
   // 兼容两种风格：Anthropic 的 x-api-key 与 OpenAI 风格 Authorization: Bearer
   const got = (
@@ -1219,12 +1224,11 @@ function authenticate(req, model) {
   );
   const active = keyDb.keys.filter((k) => !k.deleted);
 
-  // openMode（无任何 key）仅限本机回环访问；对外网卡一律拒绝，防止删光 key 后裸奍
-  const openMode = !active.length && !GATEWAY_KEY;
-  const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(clientIp(req));
+  if (!GATEWAY_KEY && !active.some((k) => k.enabled)) {
+    return { ok: false, status: 401, message: '尚未配置 API 密钥' };
+  }
 
   if (!got) {
-    if (openMode && loopback) return { ok: true, key: null };
     return { ok: false, status: 401, message: '缺少 API Key' };
   }
   if (GATEWAY_KEY && got === GATEWAY_KEY) {
@@ -1233,7 +1237,6 @@ function authenticate(req, model) {
   const h = sha256(got);
   const k = active.find((x) => x.hash === h);
   if (!k) {
-    if (openMode && loopback) return { ok: true, key: null };
     return { ok: false, status: 401, message: 'API Key 无效' };
   }
   if (!k.enabled) return { ok: false, status: 403, message: 'API Key 已禁用' };
@@ -2572,7 +2575,8 @@ function handleKeys(req, res) {
     keys: active.map(publicKey),
     total: active.length,
     masterKeyEnabled: !!GATEWAY_KEY,
-    openMode: !active.length && !GATEWAY_KEY,
+    // 没有任何可用凭据时，网关拒绝所有推理调用（不再有放行模式）
+    gatewayConfigured: !!GATEWAY_KEY || active.some((k) => k.enabled),
   });
 }
 
@@ -3349,7 +3353,7 @@ async function handleConsoleApi(req, res, url) {
   }
   // GET /api/access + POST /api/access/key
   if (req.method === 'GET' && p === '/api/access') {
-    const masked = GATEWAY_KEY ? `${GATEWAY_KEY.slice(0, 6)}${'•'.repeat(18)}${GATEWAY_KEY.slice(-4)}` : '未设置 GATEWAY_KEY（开放模式）';
+    const masked = GATEWAY_KEY ? `${GATEWAY_KEY.slice(0, 6)}${'•'.repeat(18)}${GATEWAY_KEY.slice(-4)}` : '未配置主密钥';
     return sendJson(res, 200, {
       publicUrl: '',
       maskedKey: masked,
@@ -3361,7 +3365,7 @@ async function handleConsoleApi(req, res, url) {
     });
   }
   if (req.method === 'POST' && p === '/api/access/key') {
-    if (!GATEWAY_KEY) return sendJson(res, 404, { error: '未设置 GATEWAY_KEY（当前为开放模式，无需密钥）' });
+    if (!GATEWAY_KEY) return sendJson(res, 404, { error: '未配置主密钥，请在「密钥」页创建密钥' });
     return sendJson(res, 200, { key: GATEWAY_KEY });
   }
   const probeResult = p.match(/^\/api\/accounts\/(.+?)\/selftest\/([\w-]+)$/);
@@ -3489,8 +3493,8 @@ const server = http.createServer((req, res) => {
     });
   }
   if (url.pathname === '/api/auth/settings') {
-    // 已启用鉴权时读写都必须已登录；两种方式都没配置的「开放模式」下放行，
-    // 让运维能直接在控制台里启用 SSO，而不必先往 .env 里塞变量。
+    // 已启用鉴权时读写都必须已登录；两种登录方式都没配置时放行，
+    // 让运维能直接在控制台里启用 SSO，而不必先往环境变量里塞值。
     if (authEnabled() && !panelAuthed(req) && !serviceAuthed(req)) {
       return sendJson(res, 401, { error: '面板未登录或会话已过期', code: 'panel_auth' });
     }
@@ -3660,17 +3664,18 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   log(`zcgw-server listening on http://${HOST}:${PORT}`);
   log(`accounts: ${accounts.length ? accounts.map((a) => a.label).join(', ') : '(空) —— 打开面板点「登录新账号」纳管账号'}`);
-  log(`gateway key: ${GATEWAY_KEY ? '(set)' : '(WARNING: 未设置，任何人可用)'}`);
+  log(`gateway key: ${GATEWAY_KEY ? '(set)' : '(未设置)'}`);
   log(`scheduler: weighted-random topN=${POOL.topN} sticky=${POOL.stickyTtlMin}min`);
 
   // 服务器生产环境自检提示（一次性）
   if (HOST === '0.0.0.0') {
-    if (!GATEWAY_KEY && keyDb.keys.filter((k) => !k.deleted).length === 0) {
-      log('WARNING: 监听 0.0.0.0 且没有任何密钥 —— 任何人都能白嫖你的账号池！');
-      log('         服务器部署请在面板「密钥」里建一把 key，或设置 GATEWAY_KEY 环境变量');
+    const usable = keyDb.keys.filter((k) => !k.deleted && k.enabled).length;
+    if (!GATEWAY_KEY && usable === 0) {
+      log('WARNING: 还没有任何可用密钥 —— 网关会拒绝所有推理调用（401）');
+      log('         请在面板「密钥」页创建一把 key，或设置 GATEWAY_KEY 环境变量');
     }
-    if (!GATEWAY_KEY && keyDb.keys.filter((k) => !k.deleted).length > 0) {
-      log(`已启用密钥鉴权（${keyDb.keys.filter((k) => !k.deleted).length} 把），未带 key 的请求将被 401`);
+    if (!GATEWAY_KEY && usable > 0) {
+      log(`已启用密钥鉴权（${usable} 把），未带 key 的请求将被 401`);
     }
   }
 

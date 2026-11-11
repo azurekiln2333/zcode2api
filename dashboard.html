@@ -1158,7 +1158,7 @@ function keyStatusBadge(k) {
 function renderKeys(resp) {
   const keys = resp?.keys ?? state.keys;
   const totalUsed = keys.reduce((s, k) => s + (k.usedTokens || 0), 0);
-  const mode = resp?.openMode ? '当前为开放模式：没配密钥也没设 GATEWAY_KEY，任何人都能调用'
+  const mode = resp?.gatewayConfigured === false ? '还没有任何可用密钥：网关会拒绝所有推理调用（401）'
     : resp?.masterKeyEnabled ? '已启用 GATEWAY_KEY 主密钥（旧版兼容）' : '已开启鉴权：只接受下列密钥';
   $('#main-content').innerHTML = `
     <div class="page-head"><div><h1>API 密钥</h1><p>${esc(PAGE_SUB.keys)} · 共 ${keys.length} 把 · 累计 ${fmtCompact(totalUsed)} tokens</p></div>
@@ -1467,7 +1467,7 @@ async function renderAccess() {
       <div class="plan-strip" style="margin-top:10px">${models.map((m) => `<span class="plan-tag"><i></i><span>${esc(m.id)}</span></span>`).join('') || '<span class="muted">读取模型列表失败</span>'}</div>
       <div class="hint" style="margin-top:8px">Anthropic 协议：POST ${esc(base)}/v1/messages ｜ OpenAI 协议：POST ${esc(base)}/v1/chat/completions ｜ 模型列表：GET ${esc(base)}/v1/models</div></div>
     <div class="card section-card"><h2>${ico('key', 16)}鉴权</h2>
-      <div class="hint" style="margin-top:8px">请求头带 <code>x-api-key</code>（Anthropic 风格）或 <code>authorization: Bearer</code>（OpenAI 风格），值为「API 密钥」页创建的 zck_ 开头的 key；未配任何 key 且未设 GATEWAY_KEY 时为开放模式。</div></div>
+      <div class="hint" style="margin-top:8px">请求头带 <code>x-api-key</code>（Anthropic 风格）或 <code>authorization: Bearer</code>（OpenAI 风格），值为「API 密钥」页创建的 zck_ 开头的 key；没有可用密钥时网关拒绝所有调用。</div></div>
     <div class="card section-card"><h2>${ico('scroll', 16)}客户端示例</h2><pre class="codebox" style="margin-top:10px" id="acc-curl"></pre>
       <button class="button" id="acc-copy-curl" style="margin-top:10px">${ico('copy', 14)}<span>复制示例</span></button></div>
     <div class="card section-card"><h2>${ico('shield', 16)}面板与网关的口令</h2>

@@ -17,7 +17,7 @@ import { useConsole, copy, notify } from '../console'
 const { accounts } = useConsole()
 const profile = ref<{ publicUrl: string; maskedKey: string; gatewayKeySet: boolean; models: Array<{ id: string }> }>({
   publicUrl: '',
-  maskedKey: '未设置 GATEWAY_KEY（开放模式）',
+  maskedKey: '未配置主密钥',
   gatewayKeySet: false,
   models: [],
 })
@@ -30,7 +30,7 @@ const model = computed(() => profile.value.models[0]?.id || 'GLM-5.3-Flash')
 const keyHint = computed(() =>
   profile.value.gatewayKeySet
     ? '由主机 GATEWAY_KEY 环境变量配置，修改后重启容器生效。'
-    : '未设置 GATEWAY_KEY 且没有面板密钥时为开放模式；服务器部署务必配置密钥。',
+    : '未配置主密钥；请在「密钥」页创建密钥，没有可用密钥时网关会拒绝所有调用。',
 )
 const example = computed(() =>
   protocol.value === 'openai'
