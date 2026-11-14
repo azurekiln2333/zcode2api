@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readAuth, writeAuth } from './helpers/store.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 
@@ -332,7 +333,7 @@ test('SSO settings persist in the data directory across a restart',
     assert.equal(saved.status, 200);
     await first.stop();
 
-    const stored = JSON.parse(await readFile(path.join(dataDir, 'auth.json'), 'utf8'));
+    const stored = readAuth(dataDir);
     assert.equal(stored.sso.providerName, 'Persisted SSO');
     assert.ok(stored.sessionSecret.length >= 32, 'the session secret is persisted, not ephemeral');
     assert.equal(stored.sessionSecret.includes(ADMIN_KEY), false);
@@ -344,8 +345,9 @@ test('SSO settings persist in the data directory across a restart',
     assert.equal(settings.providerName, 'Persisted SSO');
     assert.equal(settings.hasClientSecret, true);
 
-    const restarted = JSON.parse(await readFile(path.join(dataDir, 'auth.json'), 'utf8'));
+    const restarted = readAuth(dataDir);
     assert.equal(restarted.sessionSecret, stored.sessionSecret, 'the secret is reused, not regenerated');
+    await second.stop();
     await rm(dataDir, { recursive: true, force: true });
   });
 
@@ -484,15 +486,18 @@ test('the panel key keeps working as a bearer after key login is disabled',
     const dataDir = await mkdtemp(path.join(os.tmpdir(), 'zcgw-auth-keyoff-'));
     const { base } = await startServer(t, { env: { PANEL_ADMIN_KEY: ADMIN_KEY }, dataDir });
     await enableSso(base, idp.issuer);
-    await t.after(() => rm(dataDir, { recursive: true, force: true }));
+    // 先把服务停掉再删目录：SQLite 持有 -wal / -shm 句柄，运行中删不掉
+    let restarted = null;
+    await t.after(async () => {
+      await restarted?.stop();
+      await rm(dataDir, { recursive: true, force: true });
+    });
 
     // Simulate the state an SSO session would have produced.
-    const stored = JSON.parse(await readFile(path.join(dataDir, 'auth.json'), 'utf8'));
+    const stored = readAuth(dataDir);
     stored.sso.keyLoginEnabled = false;
-    const { writeFile } = await import('node:fs/promises');
-    await writeFile(path.join(dataDir, 'auth.json'), JSON.stringify(stored));
-    const restarted = await startServer(t, { env: { PANEL_ADMIN_KEY: ADMIN_KEY }, dataDir });
-
+    writeAuth(dataDir, stored);
+    restarted = await startServer(t, { env: { PANEL_ADMIN_KEY: ADMIN_KEY }, dataDir });
     const config = await (await fetch(`${restarted.base}/api/auth/config`)).json();
     assert.equal(config.keyLoginEnabled, false);
 
@@ -577,6 +582,7 @@ test('rotating the panel key invalidates key sessions but not SSO sessions',
       body: JSON.stringify({ key: rotated }),
     });
     assert.equal(fresh.status, 200);
+    await second.stop();
     await rm(dataDir, { recursive: true, force: true });
   });
 
@@ -625,5 +631,6 @@ test('an SSO session survives a panel key rotation', { timeout: 30000 }, async (
   const session = await fetch(`${second.base}/api/session`, { headers: { Cookie: ssoCookie } });
   assert.equal(session.status, 200);
   assert.equal((await session.json()).user.provider, 'oidc');
+  await second.stop();
   await rm(dataDir, { recursive: true, force: true });
 });

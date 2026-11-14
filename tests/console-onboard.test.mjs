@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readAccountRecords, writeAccountRecords } from './helpers/store.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const jwt = (id) => `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ user_id: id })).toString('base64url')}.test`;
@@ -199,8 +200,8 @@ test('console API client completes both OAuth flows through the production route
         await delay(10);
       }
       assert.equal(refreshed.eligibilityRefreshing, false);
-      // Profile enrichment writes the same file in the background; inspect it after completion.
-      const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+      // Profile enrichment writes the same records in the background; inspect them after completion.
+      const saved = readAccountRecords(dataDir);
       const account = saved.find((a) => a.label === result.label);
       assert.equal(account.jwt, jwt(flow.flowId));
       assert.equal(account.activationUserId, `profile:${flow.flowId}`);
@@ -246,9 +247,8 @@ test('console API client completes both OAuth flows through the production route
 
   await t.test('incomplete authorization cannot modify an account or trigger its refresh', async () => {
     for (const account of (await api('/overview')).accounts) await waitForRefresh(account.id);
-    const file = path.join(dataDir, 'accounts.json');
-    const original = await readFile(file, 'utf8');
-    const target = JSON.parse(original).find((a) => a.oauthProvider === 'bigmodel');
+    const original = readAccountRecords(dataDir);
+    const target = original.find((a) => a.oauthProvider === 'bigmodel');
     const before = profileRequests;
     for (const oauth of [{}, { zai: { access_token: 'wrong-provider-token' } }]) {
       const flow = await api('/onboard/start', 'POST', { provider: 'bigmodel', accountId: target.label });
@@ -261,7 +261,7 @@ test('console API client completes both OAuth flows through the production route
         await assert.rejects(api(route, method, body),
           (error) => error.status === 422 && /完整授权凭证/.test(error.message));
         assert.equal(callbacks.length, callbackCount);
-        assert.equal(await readFile(file, 'utf8'), original);
+        assert.deepEqual(readAccountRecords(dataDir), original);
       }
     }
     assert.equal(profileRequests, before);
@@ -269,16 +269,15 @@ test('console API client completes both OAuth flows through the production route
   });
 
   await t.test('targeted reauthorization rejects a different identity and preserves settings for the same identity', async () => {
-    const file = path.join(dataDir, 'accounts.json');
-    const target = JSON.parse(await readFile(file)).find((a) => a.oauthProvider === 'bigmodel');
+    const target = readAccountRecords(dataDir).find((a) => a.oauthProvider === 'bigmodel');
     await api(`/accounts/${encodeURIComponent(target.label)}`, 'PATCH', { weight: 7, enabled: false, codingPlanApiKey: 'manual-preserved' });
-    const before = await readFile(file, 'utf8');
+    const before = readAccountRecords(dataDir);
     const wrong = await api('/onboard/start', 'POST', { accountId: target.label });
     assert.equal(wrong.provider, 'bigmodel');
     flows.get(wrong.flowId).ready = true;
     await assert.rejects(api(`/onboard/poll/${encodeURIComponent(wrong.flowId)}`),
       (error) => error.status === 409 && /账号不一致/.test(error.message));
-    assert.equal(await readFile(file, 'utf8'), before);
+    assert.deepEqual(readAccountRecords(dataDir), before);
     const correct = await api('/onboard/start', 'POST', { provider: 'bigmodel', accountId: target.label });
     Object.assign(flows.get(correct.flowId), { ready: true, token: target.jwt + '-renewed' });
     const result = await api(`/onboard/poll/${encodeURIComponent(correct.flowId)}`);
@@ -289,9 +288,9 @@ test('console API client completes both OAuth flows through the production route
     const refreshed = await waitForRefresh(target.label);
     assert.equal(refreshed.eligibility.activation.status, 'ready');
     assert.equal(refreshed.quotaSources.find((s) => s.id === 'coding').recovery, null);
-    const records = JSON.parse(await readFile(file));
+    const records = readAccountRecords(dataDir);
     const saved = records.find((a) => a.label === target.label);
-    assert.equal(records.length, JSON.parse(before).length);
+    assert.equal(records.length, before.length);
     assert.equal(saved.weight, 7);
     assert.equal(saved.disabled, true);
     assert.equal(saved.codingPlanApiKey, 'manual-preserved');
@@ -299,18 +298,17 @@ test('console API client completes both OAuth flows through the production route
   });
 
   await t.test('an account removed during authorization cannot be silently recreated', async () => {
-    const file = path.join(dataDir, 'accounts.json');
-    const original = await readFile(file, 'utf8');
-    const target = JSON.parse(original)[0];
+    const original = readAccountRecords(dataDir);
+    const target = original[0];
     const flow = await api('/onboard/start', 'POST', { accountId: target.label });
     Object.assign(flows.get(flow.flowId), { ready: true, token: target.jwt });
-    const without = JSON.stringify(JSON.parse(original).filter((a) => a.label !== target.label));
+    const without = original.filter((a) => a.label !== target.label);
     try {
-      await writeFile(file, without);
+      writeAccountRecords(dataDir, without);
       await assert.rejects(api(`/onboard/poll/${encodeURIComponent(flow.flowId)}`),
         (error) => error.status === 409 && /已变更或被删除/.test(error.message));
-      assert.equal(await readFile(file, 'utf8'), without);
-    } finally { await writeFile(file, original); }
+      assert.deepEqual(readAccountRecords(dataDir), without);
+    } finally { writeAccountRecords(dataDir, original); }
   });
 
   await t.test('a slow customer lookup cannot hold the ready response or consume the flow before the browser gets it', async () => {
@@ -381,7 +379,7 @@ test('console API client completes both OAuth flows through the production route
       }
       assert.equal(account.eligibilityRefreshing, false);
       assert.equal(account.eligibility.activation.status, 'ready');
-      const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+      const saved = readAccountRecords(dataDir);
       assert.equal(saved.find((a) => a.label === added.label).jwt, renewed);
       assert.equal(saved.find((a) => a.label === added.label).activationUserId, `profile:${second.flowId}`);
     } finally { release(); profileGate = null; slowProfile = null; }

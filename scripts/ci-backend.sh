@@ -9,6 +9,7 @@ echo "==> node $(node --version)"
 npm ci --omit=dev --no-audit --no-fund --loglevel=error
 echo "==> 语法检查"
 node --check zcgw-server.mjs
+node --check zcgw-store.mjs
 node --check zcgw-fingerprint.mjs
 node --check zcgw-quota.mjs
 node --check zcgw-coding.mjs

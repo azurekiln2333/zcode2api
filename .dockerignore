@@ -12,6 +12,7 @@ usage.jsonl
 pool-*.json
 security.json
 onboard-flows.json
+zcode.sqlite*
 zcode-version-cache.json
 auto-claim.json
 .git/

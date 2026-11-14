@@ -6,10 +6,11 @@
 #   docker compose logs -f watchtower  # 查看自动更新日志
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build  # 源码构建
 #
-# 数据全部落在 ./data/（宿主机可备份/编辑）：
-#   accounts.json  keys.json  usage.jsonl  pool-*.json  security.json  onboard-flows.json
+# 数据全部落在 ./data/（宿主机可备份）：
+#   zcode.sqlite（账号 / 密钥 / 调度 / 安全 / 授权流 / 用量）  auto-claim.json
 #
-# 首次部署：把 accounts.json / keys.json 等放到 ./data/ 再 up，或启动后用面板添加。
+# 首次部署：把旧版的 accounts.json / keys.json 等放到 ./data/ 再 up，会自动导入并改名 .bak；
+# 也可以直接启动后用面板添加。
 
 services:
   zcgw:

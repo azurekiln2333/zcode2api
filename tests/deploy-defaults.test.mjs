@@ -36,7 +36,7 @@ test('the image ships its own healthcheck that follows PORT', () => {
 });
 
 test('the auth modules are shipped into the runtime image', () => {
-  for (const file of ['zcgw-oidc.mjs', 'zcgw-sso.mjs']) {
+  for (const file of ['zcgw-oidc.mjs', 'zcgw-sso.mjs', 'zcgw-store.mjs']) {
     assert.ok(dockerfile.includes(file), `${file} must be copied into the image`);
   }
 });

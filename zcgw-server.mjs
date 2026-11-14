@@ -3,12 +3,12 @@
  * zcgw-server — 多账号版 ZCode → Anthropic 反代（服务器部署版）
  *
  * 与本地单账号版 (server.mjs) 的区别：
- *   - 不读 ~/.zcode/v2/credentials.json，改读 ./accounts.json（明文 JWT 数组）或 vault/ 加密库
+ *   - 不读 ~/.zcode/v2/credentials.json，改读 data/zcode.sqlite（账号表，明文 JWT）
  *   - 自动多账号轮询：3012/1005 时换下一个号重试
  *   - 对外要求 Authorization: Bearer <GATEWAY_KEY>
  *
  * 部署：
- *   accounts.json: [{ "label": "acc1", "jwt": "eyJ..." }, ...]
+ *   首次启动若 data/ 里有旧版 accounts.json 会自动导入数据库并改名 .migrated-*.bak
  *   GATEWAY_KEY=xxx PORT=8787 node zcgw-server.mjs
  */
 import http from 'node:http';
@@ -38,6 +38,7 @@ import {
   verifyIdTokenForConfig,
 } from './zcgw-oidc.mjs';
 import { InputError, sanitizeSso, validateSso, withSsoDefaults } from './zcgw-sso.mjs';
+import { ZcgwStore } from './zcgw-store.mjs';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const GATEWAY_KEY = process.env.GATEWAY_KEY || '';
@@ -207,47 +208,38 @@ const PROFILE_FILE = path.join(import.meta.dirname, 'zcode-profile.json');
 // 数据文件目录：Docker 里指向挂载卷 /app/data，本机默认与程序同目录
 const DATA_DIR = process.env.ZCGW_DATA_DIR || import.meta.dirname;
 
-const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+// 持久层：账号 / 密钥 / 调度参数 / 调度状态 / 接入流程 / 用量日志都在 data/zcode.sqlite。
+// 首次启动会把旧的 JSON 文件导入并改名 .migrated-*.bak，usage.jsonl 不导入也不改名。
+const store = new ZcgwStore(DATA_DIR, {
+  onSlowWrite: (op, info) =>
+    log(`[store] 慢写事务 ${op}：窗口内 ${info.count} 次超过 50ms，最大 ${info.maxMs.toFixed(1)}ms`),
+});
 
 /** 管理器生成的会话签名密钥：与面板管理密钥解耦，密钥轮换不会踢掉会话。 */
 function newSessionSecret() {
   return crypto.randomBytes(32).toString('base64url');
 }
 
-function readAuthFile() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-// 设置持久化在数据目录里，重启不丢；写入用临时文件 + rename，避免半截 JSON。
-const authState = (() => {
-  const stored = readAuthFile();
-  return {
-    sso: withSsoDefaults(stored.sso),
-    sessionSecret:
-      typeof stored.sessionSecret === 'string' && stored.sessionSecret.length >= 32
-        ? stored.sessionSecret
-        : newSessionSecret(),
-  };
-})();
+// 登录状态与 SSO 设置存在库里，重启不丢；写入先落库再发布内存状态。
+const storedAuth = store.readAuth();
+const authState = {
+  sso: withSsoDefaults(storedAuth.sso),
+  sessionSecret:
+    typeof storedAuth.sessionSecret === 'string' && storedAuth.sessionSecret.length >= 32
+      ? storedAuth.sessionSecret
+      : newSessionSecret(),
+};
 
 function saveAuthState() {
-  const payload = JSON.stringify(authState, null, 2);
-  const temp = `${AUTH_FILE}.tmp`;
-  fs.writeFileSync(temp, payload, { mode: 0o600 });
-  fs.renameSync(temp, AUTH_FILE);
+  store.writeAuth(authState);
 }
 
-// 首次启动时把会话密钥落盘，之后一直复用。
-if (!readAuthFile().sessionSecret) {
+// 首次启动时把会话密钥落库，之后一直复用。
+if (!storedAuth.sessionSecret) {
   try {
     saveAuthState();
   } catch (error) {
-    console.warn(`[auth] 无法写入 ${AUTH_FILE}：${error.message}，本次运行的会话在重启后失效`);
+    console.warn(`[auth] 无法写入 ${store.file}：${error.message}，本次运行的会话在重启后失效`);
   }
 }
 const clientVersion = createVersionManager({ dataDir: DATA_DIR,
@@ -275,7 +267,7 @@ function describePlan(id, name) {
   return { kind: 'other', kindZh: '其他', nameZh: name || id || '未知' };
 }
 
-/** 账号归属：国内 / 国际（按登录身份判断，可由 accounts.json 的 realm 覆盖） */
+/** 账号归属：国内 / 国际（按登录身份判断，可由账号记录的 realm 覆盖） */
 function realmFromIdentity(email) {
   const e = String(email || '').trim();
   if (!e) return 'unknown';
@@ -324,7 +316,19 @@ async function safeJson(r) {
 }
 
 // ── 账号加载 ──
-const ACC_FILE = path.join(DATA_DIR, 'accounts.json');
+// 账号配置记录保存在 data/zcode.sqlite 的 accounts 表，形状与旧版 accounts.json 的数组元素一致。
+function readAccountRecords() {
+  return store.readAccountRecords();
+}
+
+function writeAccountRecords(records) {
+  store.writeAccountRecords(records);
+}
+
+/** 账号来源是否已初始化（等价于旧代码里的“accounts.json 存在”） */
+function accountsInitialized() {
+  return store.readMeta('accounts_initialized') === '1' || readAccountRecords().length > 0;
+}
 
 // ── 官方身份接口（客户端 OEM 的 zai adapter 同款端点）──
 // 关键：这个接口认的是 OAuth access_token，不是 zcodejwttoken。
@@ -336,7 +340,7 @@ const codingClient = createCodingClient({ zaiOrigin: ZAI_ORIGIN, zcodeOrigin: UP
   persistCredential: persistCodingCredential });
 
 function persistCodingCredential(snapshot, credential) {
-  const records = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+  const records = readAccountRecords();
   const record = records.find((a) => a.jwt === snapshot.jwt && userIdFromJwt(a.jwt) === userIdFromJwt(snapshot.jwt));
   const current = accounts.find((a) => a.label === snapshot.label);
   // Discovery awaited upstream I/O. Never overwrite a newer authorization, manual key or provider edit.
@@ -344,7 +348,7 @@ function persistCodingCredential(snapshot, credential) {
       codingIdentity({ ...record, realm: detectRealm(record.jwt, record.realm, record.email) }) !== codingIdentity(snapshot) ||
       codingIdentity(current) !== codingIdentity(snapshot)) return false;
   record.codingPlanCredential = { ...credential };
-  fs.writeFileSync(ACC_FILE, JSON.stringify(records, null, 2));
+  writeAccountRecords(records);
   current.codingPlanCredential = { ...credential };
   return true;
 }
@@ -375,7 +379,7 @@ function profileUserId(profile) {
   return null;
 }
 
-/** 把一次 customerInfo 结果合并回 accounts.json 的记录；有变更返回 true */
+/** 把一次 customerInfo 结果合并回账号记录；有变更返回 true */
 function mergeCustomerInfo(rec, d) {
   if (!d) return false;
   let changed = false;
@@ -415,7 +419,7 @@ function seedLocalAccessToken() {
   try {
     const local = localAccessToken();
     if (!local) return 0;
-    const arr = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+    const arr = readAccountRecords();
     let n = 0;
     for (const a of arr) {
       if (userIdFromJwt(a.jwt) !== local.uid) continue;
@@ -424,7 +428,7 @@ function seedLocalAccessToken() {
       if (!a.activationUserId && local.activationUserId) { a.activationUserId = local.activationUserId; changed = true; }
       if (changed) n += 1;
     }
-    if (n) fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
+    if (n) writeAccountRecords(arr);
     return n;
   } catch {
     return 0;
@@ -438,7 +442,7 @@ async function identifyAll(force = false) {
   lastIdentifyAt = Date.now();
   let arr;
   try {
-    arr = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+    arr = readAccountRecords();
   } catch {
     return { updated: 0, total: 0, withToken: 0 };
   }
@@ -449,10 +453,10 @@ async function identifyAll(force = false) {
     const d = await fetchCustomerInfo(token, provider, rec.jwt);
     if (!d) continue;
     // A profile request may finish after reauthorization; never restore its old JWT.
-    const latest = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+    const latest = readAccountRecords();
     const current = latest.find((a) => a.jwt === rec.jwt && oauthTokenOf(a, provider) === token);
     if (current && mergeCustomerInfo(current, d)) {
-      fs.writeFileSync(ACC_FILE, JSON.stringify(latest, null, 2));
+      writeAccountRecords(latest);
       const live = accounts.find((a) => a.jwt === rec.jwt && oauthTokenOf(a, provider) === token);
       if (live) { mergeCustomerInfo(live, d); live.identity = displayIdentity(live); }
       updated += 1;
@@ -513,18 +517,18 @@ function localActivationUserId() {
 }
 
 function loadAccounts() {
-  // 优先用 accounts.json；没有就回退到本地 ZCode 客户端凭证（单账号模式）
-  if (fs.existsSync(ACC_FILE)) return readAccountFile();
+  // 优先用库里已纳管的账号；没有就回退到本地 ZCode 客户端凭证（单账号模式）
+  if (accountsInitialized()) return readAccountFile();
 
   const jwt = localJwt();
   if (!jwt) {
     // 空池不能退出：面板必须先起来，用户才能用「登录新账号」按钮纳管账号，
     // 否则容器 crash loop，永远进不了面板（先有鸡还是先有蛋）
-    console.error('既没有 accounts.json，也没有本地 ZCode 登录态 —— 以空账号池启动。');
-    console.error('请打开面板点「登录新账号」纳管账号，或在 data/ 放一个 accounts.json 后重启。');
+    console.error('库里还没有账号，也没有本地 ZCode 登录态 —— 以空账号池启动。');
+    console.error('请打开面板点「登录新账号」纳管账号后重启。');
     return [];
   }
-  log('未找到 accounts.json，使用本地 ZCode 客户端凭证（单账号模式）');
+  log('库里还没有账号，使用本地 ZCode 客户端凭证（单账号模式）');
   const uid = userIdFromJwt(jwt);
   return [
     {
@@ -549,13 +553,9 @@ function loadAccounts() {
 function readAccountFile() {
   let arr;
   try {
-    arr = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+    arr = readAccountRecords();
   } catch (e) {
-    console.error(`accounts.json 读取/解析失败（${e.message}）—— 以空账号池启动，请修复该文件后重启。`);
-    return [];
-  }
-  if (!Array.isArray(arr)) {
-    console.error('accounts.json 格式不对（顶层应为数组）—— 以空账号池启动。');
+    console.error(`账号记录读取/解析失败（${e.message}）—— 以空账号池启动，请用备份修复 data/zcode.sqlite 后重启。`);
     return [];
   }
   return arr
@@ -598,9 +598,9 @@ function readAccountFile() {
     });
 }
 
-/** 把新账号写回 accounts.json（保留已有账号） */
+/** 把新账号写回库（保留已有账号） */
 function persistAccount(jwt, label, extra = {}) {
-  const arr = fs.existsSync(ACC_FILE) ? JSON.parse(fs.readFileSync(ACC_FILE, 'utf8')) : [];
+  const arr = readAccountRecords();
   const uid = userIdFromJwt(jwt);
   const email = extra.email || null;
   const realm = extra.realm || detectRealm(jwt, null, email);
@@ -622,7 +622,7 @@ function persistAccount(jwt, label, extra = {}) {
     }
     if (activationUserId) existing.activationUserId = activationUserId;
     if (realm !== 'unknown') existing.realm = realm;
-    fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
+    writeAccountRecords(arr);
     return { added: false, label: existing.label };
   }
   arr.push({
@@ -635,14 +635,13 @@ function persistAccount(jwt, label, extra = {}) {
     ...(extra.oauthProvider ? { oauthProvider, codingPlanProvider: oauthProvider } : {}),
     ...(activationUserId ? { activationUserId } : {}),
   });
-  fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
+  writeAccountRecords(arr);
   return { added: true, label };
 }
 
 let accounts = loadAccounts();
 
-// ── 调度参数：环境变量为默认值，面板可在线改（持久化到 pool-settings.json）──
-const SETTINGS_FILE = path.join(DATA_DIR, 'pool-settings.json');
+// ── 调度参数：环境变量为默认值，面板可在线改（持久化到 zcode.sqlite 的 settings 表）──
 
 // 调度设置的可调范围（面板表单校验用）
 const POOL_LIMITS = {
@@ -699,17 +698,16 @@ function readSettings() {
     if (env[k] !== undefined && env[k] !== '') out[k] = clamp(env[k], POOL_LIMITS[k]);
   }
   try {
-    const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    const saved = store.readPoolSettings();
     for (const k of Object.keys(POOL_DEFAULTS)) {
-      if (saved[k] !== undefined) out[k] = clamp(saved[k], POOL_LIMITS[k]);
+      if (saved?.[k] !== undefined) out[k] = clamp(saved[k], POOL_LIMITS[k]);
     }
-    out.__fromFile = true;
+    if (saved) out.__fromFile = true;
   } catch {}
   return out;
 }
 
 const POOL = readSettings();
-const STATE_FILE = path.join(DATA_DIR, 'pool-state.json');
 
 function applyPoolSettings(body) {
   const applied = {};
@@ -719,12 +717,7 @@ function applyPoolSettings(body) {
     POOL[k] = v;
     applied[k] = v;
   }
-  try {
-    const cur = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ ...cur, ...applied }, null, 2));
-  } catch {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(applied, null, 2));
-  }
+  store.writePoolSettings({ ...(store.readPoolSettings() ?? {}), ...applied });
   log('调度参数已更新:', JSON.stringify(applied));
   return applied;
 }
@@ -737,28 +730,25 @@ let lastPick = null; // 上一次抽中的号（同进程内防连击）
 // ── 调度状态持久化：重启不丢冷却/降权/统计 ──
 function savePoolState() {
   try {
-    const data = {
-      version: 1,
-      savedAt: Date.now(),
-      accounts: accounts.map((a) => ({
-        uid: a.uid,
-        cooldownUntil: a.cooldownUntil || 0,
-        degradeUntil: a.degradeUntil || 0,
-        consecutiveFails: a.consecutiveFails || 0,
-        failures: a.failures || 0,
-        successCount: a.successCount || 0,
-        errTotal: a.errTotal || 0,
-        lastSuccess: a.lastSuccess || null,
-        lastUsedAt: a.lastUsedAt || 0,
-      })),
-    };
-    fs.writeFileSync(POOL.stateFile, JSON.stringify(data));
-  } catch {}
+    store.writePoolState(accounts.map((a) => ({
+      uid: a.uid,
+      cooldownUntil: a.cooldownUntil || 0,
+      degradeUntil: a.degradeUntil || 0,
+      consecutiveFails: a.consecutiveFails || 0,
+      failures: a.failures || 0,
+      successCount: a.successCount || 0,
+      errTotal: a.errTotal || 0,
+      lastSuccess: a.lastSuccess || null,
+      lastUsedAt: a.lastUsedAt || 0,
+    })));
+  } catch (e) {
+    log('调度状态落库失败:', e.message);
+  }
 }
 
 function loadPoolState() {
   try {
-    const data = JSON.parse(fs.readFileSync(POOL.stateFile, 'utf8'));
+    const data = store.readPoolState();
     let n = 0;
     for (const a of accounts) {
       const s = data.accounts?.find((x) => x.uid === a.uid);
@@ -774,7 +764,7 @@ function loadPoolState() {
       a.lastUsedAt = s.lastUsedAt || 0;
       n++;
     }
-    if (n) log(`已恢复账号池调度状态 ${n} 个（pool-state.json）`);
+    if (n) log(`已恢复账号池调度状态 ${n} 个（zcode.sqlite）`);
   } catch {}
 }
 const persistState = debounce(savePoolState, 2000);
@@ -1070,26 +1060,24 @@ function sendJson(res, status, payload) {
 }
 
 // ── 多密钥分发（对外反代网关的 API Key）──
-const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
-const USAGE_FILE = path.join(DATA_DIR, 'usage.jsonl');
 const KEY_PREFIX = 'zck_';
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 
 function readKeys() {
   try {
-    const obj = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-    return Array.isArray(obj.keys) ? obj : { version: 1, keys: [] };
-  } catch {
+    return store.readKeys();
+  } catch (e) {
+    log('读密钥失败:', e.message);
     return { version: 1, keys: [] };
   }
 }
 
 function writeKeys(db) {
   try {
-    fs.writeFileSync(KEYS_FILE, JSON.stringify(db, null, 2));
+    store.writeKeys(db);
   } catch (e) {
-    log('写 keys.json 失败:', e.message);
+    log('写密钥失败:', e.message);
   }
 }
 
@@ -1136,7 +1124,6 @@ function clientIp(req) {
 }
 
 // ── 全局 IP 管控 + 拦截审计（参考 wb2api security 页）──
-const SEC_FILE = path.join(DATA_DIR, 'security.json');
 const security = {
   enabled: false,          // 总开关；关=不检查 IP 规则
   mode: 'blacklist',       // blacklist(默认放行，命中拒绝) | whitelist(默认拒绝，命中放行)
@@ -1145,17 +1132,19 @@ const security = {
 };
 
 try {
-  if (fs.existsSync(SEC_FILE)) Object.assign(security, JSON.parse(fs.readFileSync(SEC_FILE, 'utf8')));
-} catch {}
+  Object.assign(security, store.readSecurity() ?? {});
+} catch (e) {
+  console.error(`安全规则读取失败（${e.message}）—— 本次运行用默认值启动，请用备份修复 data/zcode.sqlite`);
+}
 
 function saveSecurity() {
   try {
-    fs.writeFileSync(SEC_FILE, JSON.stringify({
+    store.writeSecurity({
       enabled: security.enabled,
       mode: security.mode,
       rules: security.rules.slice(-200),
       blockedLog: security.blockedLog.slice(-500),
-    }, null, 2));
+    });
   } catch {}
 }
 
@@ -1254,21 +1243,16 @@ function authenticate(req, model) {
   return { ok: true, key: k };
 }
 
-// ── 用量采集（内存环形 + jsonl 落盘）──
+// ── 用量采集（内存环形 + 库内追加）──
 const USAGE_MAX = 6000;
 let usageLog = [];
 
 try {
-  if (fs.existsSync(USAGE_FILE)) {
-    const lines = fs.readFileSync(USAGE_FILE, 'utf8').trim().split('\n').slice(-USAGE_MAX);
-    for (const l of lines) {
-      try {
-        usageLog.push(JSON.parse(l));
-      } catch {}
-    }
-    log(`已载入历史用量记录 ${usageLog.length} 条`);
-  }
-} catch {}
+  usageLog = store.readUsage(USAGE_MAX);
+  if (usageLog.length) log(`已载入历史用量记录 ${usageLog.length} 条`);
+} catch (e) {
+  log('读取历史用量失败:', e.message);
+}
 
 function recordUsage(req, rec) {
   // 请求日志带来源 IP 与 UA（wb2api logs 风格，方便事后审计谁在用什么打进来）
@@ -1279,8 +1263,10 @@ function recordUsage(req, rec) {
   usageLog.push(rec);
   if (usageLog.length > USAGE_MAX) usageLog = usageLog.slice(-USAGE_MAX);
   try {
-    fs.appendFileSync(USAGE_FILE, JSON.stringify(rec) + '\n');
-  } catch {}
+    store.appendUsage(rec);
+  } catch (e) {
+    log('用量日志落库失败:', e.message);
+  }
 
   // 同步累到密钥头上
   if (rec.keyId) {
@@ -1440,7 +1426,7 @@ async function handleOpenAIChat(req, res) {
   const sessionKey = sessionKeyOf(req, inbound);
 
   if (!accounts.length) {
-    return sendJson(res, 503, { error: { message: '尚未纳管任何账号：请打开面板点「登录新账号」，或在 data/accounts.json 配置 JWT', type: 'api_error' } });
+    return sendJson(res, 503, { error: { message: '尚未纳管任何账号：请打开面板点「登录新账号」纳管账号后重启', type: 'api_error' } });
   }
   if (!accounts.some((a) => !a.disabled)) {
     return sendJson(res, 503, { error: { message: '账号池内所有账号已被手动停用：请在面板「账号管理」里重新启用', type: 'api_error' } });
@@ -1541,7 +1527,7 @@ async function handleMessages(req, res) {
   const sessionKey = sessionKeyOf(req, inbound);
 
   if (!accounts.length) {
-    return sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: '尚未纳管任何账号：请打开面板点「登录新账号」，或在 data/accounts.json 配置 JWT' } });
+    return sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: '尚未纳管任何账号：请打开面板点「登录新账号」纳管账号后重启' } });
   }
   if (!accounts.some((a) => !a.disabled)) {
     return sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: '账号池内所有账号已被手动停用：请在面板「账号管理」里重新启用' } });
@@ -1930,10 +1916,10 @@ function refreshAfterAuthorization(acc) {
       const jwt = current.jwt;
       const profile = await fetchCustomerInfo(token, provider, jwt);
       // Re-read after the network wait so concurrent edits/new authorizations survive.
-      const records = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8'));
+      const records = readAccountRecords();
       const record = records.find((a) => a.label === label && a.jwt === jwt && oauthTokenOf(a, provider) === token);
       if (record && mergeCustomerInfo(record, profile)) {
-        fs.writeFileSync(ACC_FILE, JSON.stringify(records, null, 2));
+        writeAccountRecords(records);
         const live = accounts.find((a) => a.label === label && a.jwt === record.jwt);
         if (live) { mergeCustomerInfo(live, profile); live.identity = displayIdentity(live); }
       }
@@ -2116,26 +2102,23 @@ async function handleClaim(req, res, labelOverride) {
 }
 
 // ── 无头登录（设备授权流）：登录后保存授权身份 ──
-// flow 要落盘：网关重启不该把你正在等的那次授权弄丢
-const FLOW_FILE = path.join(DATA_DIR, 'onboard-flows.json');
+// flow 要落库：网关重启不该把你正在等的那次授权弄丢
 // 每个上游资格/领取请求的超时。
 const CLAIM_TIMEOUT_MS = Number(process.env.ZCGW_CLAIM_TIMEOUT_MS || 15000);
 
 function readFlows() {
   try {
-    const obj = JSON.parse(fs.readFileSync(FLOW_FILE, 'utf8'));
-    const map = new Map();
-    const cut = Date.now() - 20 * 60_000;
-    for (const [k, v] of Object.entries(obj)) if (v.createdAt > cut) map.set(k, v);
-    return map;
-  } catch {
+    // 只保留 20 分钟内的流程（与旧版按 createdAt 过滤一致）
+    return store.readFlows(Date.now() - 20 * 60_000);
+  } catch (e) {
+    log('读取登录授权流程失败:', e.message);
     return new Map();
   }
 }
 
 function writeFlows(map) {
   try {
-    fs.writeFileSync(FLOW_FILE, JSON.stringify(Object.fromEntries(map), null, 2));
+    store.writeFlows(map);
   } catch {}
 }
 
@@ -2460,7 +2443,7 @@ async function handleAccountUpdate(req, res) {
   } catch {}
   if (!body.label) return sendJson(res, 400, { error: '缺少 label' });
 
-  const arr = fs.existsSync(ACC_FILE) ? JSON.parse(fs.readFileSync(ACC_FILE, 'utf8')) : [];
+  const arr = readAccountRecords();
   const target = arr.find((a) => (a.label || '') === body.label);
   if (!target) return sendJson(res, 404, { error: `找不到账号 ${body.label}` });
 
@@ -2480,7 +2463,7 @@ async function handleAccountUpdate(req, res) {
   // 手动停用：true = 彻底退出调度（含全冷却兜底），与 weight=0 的软暂停不同
   if (body.disabled !== undefined) target.disabled = !!body.disabled;
 
-  fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
+  writeAccountRecords(arr);
   accounts = readAccountFile();
   const acc = accounts.find((a) => a.label === target.label);
   sendJson(res, 200, {
@@ -3410,7 +3393,7 @@ async function handleConsoleApi(req, res, url) {
       const raw = await readBody(req);
       let body = {};
       try { body = raw.length ? JSON.parse(raw.toString('utf8')) : {}; } catch {}
-      const arr = fs.existsSync(ACC_FILE) ? JSON.parse(fs.readFileSync(ACC_FILE, 'utf8')) : [];
+      const arr = readAccountRecords();
       const target = arr.find((a) => (a.label || '') === id);
       if (!target) return sendJson(res, 404, { error: `找不到账号 ${id}` });
       if (body.codingPlanApiKey !== undefined) {
@@ -3431,7 +3414,7 @@ async function handleConsoleApi(req, res, url) {
         const w = Number(body.weight);
         target.weight = Number.isFinite(w) ? Math.max(0, Math.min(20, w)) : 1;
       }
-      fs.writeFileSync(ACC_FILE, JSON.stringify(arr, null, 2));
+      writeAccountRecords(arr);
       // Editing quota credentials must not reset scheduler cooldowns or in-flight counts.
       const previousAccounts = new Map(accounts.map((a) => [a.label, a]));
       accounts = readAccountFile().map((a) => {

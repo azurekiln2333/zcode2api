@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readAccountRecords } from './helpers/store.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const jwt = (id) => `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ user_id: id })).toString('base64url')}.test`;
@@ -19,7 +20,8 @@ async function until(condition) {
 test('gateway persists discovered keys across restart and rejects stale discovery writes', { timeout: 20000 }, async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'zcgw-coding-persistence-'));
   const accountFile = path.join(dataDir, 'accounts.json');
-  const readAccounts = async () => JSON.parse(await readFile(accountFile, 'utf8'));
+  // 旧格式夹具：首次启动会导入数据库并改名 .bak，后续读写都走 SQLite
+  const readAccounts = async () => readAccountRecords(dataDir);
   await writeFile(accountFile, JSON.stringify(['saved', 'manual-race', 'reauth-race'].map((id) => ({
     label: id, jwt: jwt(id), oauthProvider: 'bigmodel', realm: 'cn',
     bigmodelAccessToken: `${id}-oauth`, activationUserId: `${id}-profile`,

@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readAccountRecords } from './helpers/store.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const jwt = (id) => `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ user_id: id })).toString('base64url')}.test`;
@@ -425,7 +426,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
     const profile = (await api('/api/accounts/profile-account/refresh', 'POST', {})).body;
     assert.equal(profile.eligibility.activation.status, 'ready');
     assert.deepEqual(activationEvents.slice(before).map((e) => e.body.user_id), ['customer-profile-id', 'customer-profile-id']);
-    const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+    const saved = readAccountRecords(dataDir);
     assert.equal(saved.find((a) => a.label === 'profile-account').activationUserId, 'customer-profile-id');
     const overview = (await api('/api/overview')).body;
     assert.ok(!JSON.stringify(overview).includes('customer-profile-id'));
@@ -449,7 +450,7 @@ test('authenticated console refresh preserves distinct sources and partial failu
     assert.equal(loggedIn.body.label, 'unconfigured');
     assert.equal(loggedIn.body.eligibilityRefreshing, true);
     assert.equal((await api('/api/overview')).body.accounts.find((a) => a.id === 'unconfigured').eligibilityRefreshing, true);
-    const saved = JSON.parse(await readFile(path.join(dataDir, 'accounts.json')));
+    const saved = readAccountRecords(dataDir);
     assert.equal(saved.find((a) => a.label === 'unconfigured').activationUserId, 'reauthed-profile');
     assert.equal(saved.find((a) => a.label === 'unconfigured').jwt, renewedJwt, 're-login must replace the stored gateway JWT');
     releaseBalance();
